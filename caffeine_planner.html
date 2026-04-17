@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0f0d14">
+<title>Caffeine · A scheduling tool</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,400&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<style>
+  :root {
+    --bg: #0f0d14;
+    --bg-2: #17141d;
+    --surface: #1c1826;
+    --surface-2: #241f30;
+    --line: rgba(255,255,255,0.07);
+    --line-2: rgba(255,255,255,0.12);
+    --ink: #f3eee4;
+    --ink-dim: #a69db0;
+    --ink-soft: #6d6577;
+    --accent: #c9a86b;       /* warm amber — coffee */
+    --accent-2: #e8d5a3;
+    --good: #6fc9a5;         /* soft emerald */
+    --warn: #e89a4f;
+    --bad: #e87272;
+    --curve: #b89d68;
+    --curve-glow: rgba(201,168,107,0.18);
+    --serif: 'Fraunces', Georgia, serif;
+    --sans: 'DM Sans', system-ui, sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    --r-sm: 10px;
+    --r: 14px;
+    --r-lg: 20px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(201,168,107,0.08), transparent 60%),
+      radial-gradient(900px 500px at -10% 100%, rgba(111,201,165,0.05), transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix values='0 0 0 0 0.95  0 0 0 0 0.93  0 0 0 0 0.9  0 0 0 0.035 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    pointer-events: none;
+    z-index: 1;
+    mix-blend-mode: overlay;
+    opacity: 0.6;
+  }
+
+  #root { position: relative; z-index: 2; }
+
+  /* Range sliders — unified look */
+  input[type=range] {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 22px;
+    background: transparent;
+    cursor: pointer;
+    width: 100%;
+    padding: 0;
+    margin: 0;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 4px;
+    background: linear-gradient(90deg, var(--accent) var(--pct, 50%), rgba(255,255,255,0.08) var(--pct, 50%));
+    border-radius: 999px;
+  }
+  input[type=range]::-moz-range-track {
+    height: 4px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 999px;
+  }
+  input[type=range]::-moz-range-progress {
+    height: 4px;
+    background: var(--accent);
+    border-radius: 999px;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--ink);
+    border: 3px solid var(--accent);
+    margin-top: -7px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  input[type=range]::-webkit-slider-thumb:hover,
+  input[type=range]:focus::-webkit-slider-thumb {
+    transform: scale(1.15);
+    box-shadow: 0 2px 10px rgba(201,168,107,0.5);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--ink);
+    border: 3px solid var(--accent);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+
+  button {
+    font-family: inherit;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  select, input[type=number], input[type=time] {
+    font-family: inherit;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: var(--r-sm);
+    padding: 8px 12px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  select:focus, input[type=number]:focus, input[type=time]:focus {
+    border-color: var(--accent);
+    background: var(--surface);
+  }
+
+  /* Custom time input dark styling */
+  input[type=time]::-webkit-calendar-picker-indicator {
+    filter: invert(0.8);
+    cursor: pointer;
+  }
+
+  ::selection { background: var(--accent); color: var(--bg); }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .fade-up { animation: fadeUp 0.4s ease both; }
+
+  @keyframes pulse-dot {
+    0%, 100% { box-shadow: 0 0 0 0 var(--good); }
+    50% { box-shadow: 0 0 0 6px rgba(111,201,165,0); }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+/* ---------- constants & helpers ---------- */
+const HL = 5.5; // caffeine half-life (hours)
+const DAILY_LIMIT = 400;
+const SLEEP_THRESHOLD = 50;
+
+const DRINKS = {
+  espresso:  { label: "Espresso shot",      mg: 64,  icon: "●" },
+  coffee:    { label: "Drip coffee (8oz)",  mg: 95,  icon: "☕" },
+  cold_brew: { label: "Cold brew (12oz)",   mg: 200, icon: "◉" },
+  monster:   { label: "Monster Ultra",      mg: 150, icon: "⚡" },
+  redbull:   { label: "Red Bull (8.4oz)",   mg: 80,  icon: "⚡" },
+  tea_black: { label: "Black tea (8oz)",    mg: 47,  icon: "☘" },
+  tea_green: { label: "Green tea (8oz)",    mg: 28,  icon: "☘" },
+  matcha:    { label: "Matcha (1 tsp)",     mg: 70,  icon: "☘" },
+  davidoff:  { label: "Davidoff 57 (1 tsp)", mg: 57, icon: "☕" },
+  custom:    { label: "Custom",              mg: 100, icon: "✦" },
+};
+
+const fmtTime = (h, short = false) => {
+  let x = ((h % 24) + 24) % 24;
+  let mn = Math.round((x - Math.floor(x)) * 60);
+  let hr = Math.floor(x);
+  if (mn === 60) { hr += 1; mn = 0; }
+  const h12 = hr === 0 ? 12 : hr > 12 ? hr - 12 : hr;
+  const ap = hr >= 12 ? "PM" : "AM";
+  const day = (!short && h >= 24) ? " next day" : "";
+  return `${h12}:${String(mn).padStart(2, "0")} ${ap}${day}`;
+};
+
+const hoursToHHMM = h => {
+  let x = ((h % 24) + 24) % 24;
+  let mn = Math.round((x - Math.floor(x)) * 60);
+  let hr = Math.floor(x);
+  if (mn === 60) { hr += 1; mn = 0; }
+  return `${String(hr).padStart(2,"0")}:${String(mn).padStart(2,"0")}`;
+};
+const hhmmToHours = s => {
+  const [h, m] = s.split(":").map(Number);
+  return h + m/60;
+};
+
+const caffeineAt = (t, doses) => {
+  let s = 0;
+  for (const d of doses) {
+    if (t >= d.time) {
+      const el = t - d.time;
+      s += d.mg * Math.min(1, el / 0.75) * Math.pow(0.5, el / HL);
+    }
+  }
+  return s;
+};
+
+/* ---------- Chart ---------- */
+function Chart({ doses, pS, pE, sT, clearTime }) {
+  const ref = useRef(null);
+  const [hover, setHover] = useState(null);
+  const [dims, setDims] = useState({ W: 0, H: 0 });
+
+  const draw = useCallback((hoverPt) => {
+    const c = ref.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const r = c.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return;
+
+    c.width = r.width * dpr;
+    c.height = r.height * dpr;
+    ctx.scale(dpr, dpr);
+    const W = r.width, H = r.height;
+    setDims({ W, H });
+
+    const p = { t: 28, r: 16, b: 30, l: 36 };
+    const cW = W - p.l - p.r, cH = H - p.t - p.b;
+    if (cW <= 0 || cH <= 0) return;
+
+    ctx.clearRect(0, 0, W, H);
+
+    const eT = Math.max(sT + 1, 26, clearTime ? clearTime + 1 : 26);
+    const pts = [];
+    let mx = 150;
+    for (let t = 6; t <= eT; t += 0.2) {
+      const v = caffeineAt(t, doses);
+      if (v > mx) mx = v;
+      pts.push({ t, v });
+    }
+    mx = Math.ceil(mx / 50) * 50 + 20;
+
+    const xO = t => p.l + ((t - 6) / (eT - 6)) * cW;
+    const yO = v => p.t + (1 - v / mx) * cH;
+
+    // Zones
+    ctx.fillStyle = "rgba(111,201,165,0.06)";
+    ctx.fillRect(xO(pS), p.t, xO(pE) - xO(pS), cH);
+    ctx.fillStyle = "rgba(232,114,114,0.06)";
+    ctx.fillRect(xO(sT), p.t, xO(eT) - xO(sT), cH);
+
+    // Horizontal grid
+    ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    ctx.lineWidth = 1;
+    for (let v = 0; v <= mx; v += 50) {
+      ctx.beginPath();
+      ctx.moveTo(p.l, yO(v));
+      ctx.lineTo(p.l + cW, yO(v));
+      ctx.stroke();
+    }
+
+    // 50 mg line
+    ctx.setLineDash([2, 4]);
+    ctx.strokeStyle = "rgba(111,201,165,0.35)";
+    ctx.beginPath();
+    ctx.moveTo(p.l, yO(50));
+    ctx.lineTo(p.l + cW, yO(50));
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Dose markers
+    doses.forEach(d => {
+      const dx = xO(d.time);
+      ctx.strokeStyle = "rgba(201,168,107,0.25)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(dx, p.t);
+      ctx.lineTo(dx, p.t + cH);
+      ctx.stroke();
+      // small droplet at top
+      ctx.fillStyle = "rgba(201,168,107,0.9)";
+      ctx.beginPath();
+      ctx.arc(dx, p.t - 4, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // Curve fill — gradient
+    const grad = ctx.createLinearGradient(0, p.t, 0, p.t + cH);
+    grad.addColorStop(0, "rgba(201,168,107,0.28)");
+    grad.addColorStop(1, "rgba(201,168,107,0)");
+    ctx.beginPath();
+    ctx.moveTo(xO(pts[0].t), yO(0));
+    pts.forEach(q => ctx.lineTo(xO(q.t), yO(q.v)));
+    ctx.lineTo(xO(pts[pts.length - 1].t), yO(0));
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Curve stroke
+    ctx.beginPath();
+    pts.forEach((q, i) => i === 0 ? ctx.moveTo(xO(q.t), yO(q.v)) : ctx.lineTo(xO(q.t), yO(q.v)));
+    ctx.strokeStyle = "#c9a86b";
+    ctx.lineWidth = 2;
+    ctx.shadowColor = "rgba(201,168,107,0.4)";
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Safe-to-sleep marker
+    if (clearTime && clearTime <= eT) {
+      const cx = xO(clearTime);
+      const cy = yO(50);
+      ctx.setLineDash([2, 3]);
+      ctx.strokeStyle = "rgba(111,201,165,0.6)";
+      ctx.beginPath();
+      ctx.moveTo(cx, p.t);
+      ctx.lineTo(cx, p.t + cH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.fillStyle = "#6fc9a5";
+      ctx.fill();
+      ctx.strokeStyle = "#0f0d14";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // Axis labels
+    ctx.fillStyle = "rgba(166,157,176,0.7)";
+    ctx.font = "500 10px 'DM Sans', sans-serif";
+    ctx.textAlign = "center";
+    const step = eT > 30 ? 4 : 3;
+    for (let t = 6; t <= eT; t += step) {
+      ctx.fillText(fmtTime(t, true), xO(t), p.t + cH + 16);
+    }
+    ctx.textAlign = "right";
+    for (let v = 0; v <= mx; v += 100) {
+      ctx.fillText(v + "", p.l - 6, yO(v) + 3);
+    }
+
+    // Hover crosshair
+    if (hoverPt) {
+      const { t: ht, v: hv } = hoverPt;
+      const hx = xO(ht);
+      const hy = yO(hv);
+      ctx.strokeStyle = "rgba(243,238,228,0.25)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(hx, p.t);
+      ctx.lineTo(hx, p.t + cH);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(hx, hy, 4, 0, Math.PI * 2);
+      ctx.fillStyle = "#f3eee4";
+      ctx.fill();
+      ctx.strokeStyle = "#c9a86b";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Tooltip
+      const label = `${Math.round(hv)} mg · ${fmtTime(ht, true)}`;
+      ctx.font = "600 11px 'JetBrains Mono', monospace";
+      const tw = ctx.measureText(label).width;
+      const boxW = tw + 16, boxH = 22;
+      let bx = hx + 10;
+      if (bx + boxW > W - 4) bx = hx - boxW - 10;
+      const by = Math.max(p.t, hy - boxH - 8);
+      ctx.fillStyle = "rgba(28,24,38,0.95)";
+      ctx.strokeStyle = "rgba(201,168,107,0.4)";
+      ctx.lineWidth = 1;
+      if (ctx.roundRect) {
+        ctx.beginPath(); ctx.roundRect(bx, by, boxW, boxH, 6); ctx.fill(); ctx.stroke();
+      } else {
+        ctx.fillRect(bx, by, boxW, boxH); ctx.strokeRect(bx, by, boxW, boxH);
+      }
+      ctx.fillStyle = "#f3eee4";
+      ctx.textAlign = "left";
+      ctx.fillText(label, bx + 8, by + 15);
+    }
+  }, [doses, pS, pE, sT, clearTime]);
+
+  useEffect(() => {
+    const id = setTimeout(() => draw(hover), 16);
+    return () => clearTimeout(id);
+  }, [draw, hover]);
+
+  useEffect(() => {
+    const h = () => draw(hover);
+    window.addEventListener("resize", h);
+    return () => window.removeEventListener("resize", h);
+  }, [draw, hover]);
+
+  const onMove = (e) => {
+    const c = ref.current;
+    if (!c) return;
+    const r = c.getBoundingClientRect();
+    const p = { t: 28, r: 16, b: 30, l: 36 };
+    const cW = r.width - p.l - p.r;
+    if (cW <= 0) return;
+    const touch = e.touches && e.touches[0];
+    const clientX = touch ? touch.clientX : e.clientX;
+    const x = clientX - r.left;
+    if (x < p.l || x > p.l + cW) { setHover(null); return; }
+    const eT = Math.max(sT + 1, 26, clearTime ? clearTime + 1 : 26);
+    const t = 6 + ((x - p.l) / cW) * (eT - 6);
+    const v = caffeineAt(t, doses);
+    setHover({ t, v });
+  };
+
+  return (
+    <canvas
+      ref={ref}
+      onMouseMove={onMove}
+      onMouseLeave={() => setHover(null)}
+      onTouchStart={onMove}
+      onTouchMove={onMove}
+      onTouchEnd={() => setHover(null)}
+      style={{ width: "100%", height: "280px", display: "block", touchAction: "pan-y" }}
+    />
+  );
+}
+
+/* ---------- App ---------- */
+function App() {
+  const [doses, setDoses] = useState(() => {
+    try {
+      const saved = localStorage.getItem("caffeine-doses-v2");
+      if (saved) return JSON.parse(saved);
+    } catch(e) {}
+    return [
+      { time: 8.5,  mg: 95, type: "coffee" },
+      { time: 14,   mg: 64, type: "espresso" },
+    ];
+  });
+  const [pS, setPS] = useState(() => +localStorage.getItem("cf-pS") || 9);
+  const [pE, setPE] = useState(() => +localStorage.getItem("cf-pE") || 17);
+  const [sT, setST] = useState(() => +localStorage.getItem("cf-sT") || 23);
+
+  useEffect(() => { localStorage.setItem("caffeine-doses-v2", JSON.stringify(doses)); }, [doses]);
+  useEffect(() => { localStorage.setItem("cf-pS", pS); }, [pS]);
+  useEffect(() => { localStorage.setItem("cf-pE", pE); }, [pE]);
+  useEffect(() => { localStorage.setItem("cf-sT", sT); }, [sT]);
+
+  /* derived values */
+  const total = doses.reduce((s, d) => s + d.mg, 0);
+  const peakAvg = useMemo(() => {
+    let sum = 0, n = 0;
+    for (let t = pS; t <= pE; t += 0.25) { sum += caffeineAt(t, doses); n++; }
+    return n ? sum / n : 0;
+  }, [doses, pS, pE]);
+  const sleepLevel = caffeineAt(sT, doses);
+  const sleepOk = sleepLevel < SLEEP_THRESHOLD;
+  const totalOk = total <= DAILY_LIMIT;
+
+  const clearTime = useMemo(() => {
+    if (!doses.length) return null;
+    const maxDoseTime = Math.max(...doses.map(d => d.time));
+    for (let t = 6; t <= 72; t += 0.1) {
+      if (t >= maxDoseTime && caffeineAt(t, doses) < SLEEP_THRESHOLD) return t;
+    }
+    return null;
+  }, [doses]);
+
+  let verdict, verdictTone;
+  if (sleepOk && totalOk && peakAvg >= 60) { verdict = "Optimal"; verdictTone = "good"; }
+  else if (sleepOk && peakAvg >= 40) { verdict = totalOk ? "Decent" : "Over daily limit"; verdictTone = "warn"; }
+  else { verdict = !sleepOk ? "Sleep delayed" : "Low alertness"; verdictTone = "bad"; }
+
+  const tips = [];
+  if (!sleepOk && clearTime) tips.push({ tone: "bad", text: `Caffeine stays above ${SLEEP_THRESHOLD}mg until ${fmtTime(clearTime)}. Bedtime is compromised.` });
+  else if (clearTime) tips.push({ tone: "good", text: `You'll be safe to sleep by ${fmtTime(clearTime)}.` });
+  if (!totalOk) tips.push({ tone: "warn", text: `${total} mg total exceeds the 400 mg daily guideline.` });
+  if (peakAvg < 50 && doses.length > 0) tips.push({ tone: "warn", text: `Peak alertness average is only ${Math.round(peakAvg)} mg — consider an earlier dose.` });
+
+  // daytime dip detection (between doses)
+  if (doses.length >= 1) {
+    const dips = [];
+    for (let t = Math.max(8, Math.min(...doses.map(d=>d.time))+1); t <= 18; t += 0.5) {
+      dips.push({ t, v: caffeineAt(t, doses) });
+    }
+    if (dips.length > 4) {
+      const low = dips.reduce((a,b) => a.v < b.v ? a : b);
+      if (low.v < 30) tips.push({ tone: "warn", text: `Afternoon dip around ${fmtTime(low.t, true)} (~${Math.round(low.v)} mg).` });
+    }
+  }
+
+  const updateDose = (i, patch) => {
+    const a = [...doses];
+    a[i] = { ...a[i], ...patch };
+    setDoses(a);
+  };
+  const removeDose = i => setDoses(doses.filter((_, j) => j !== i));
+  const addDose = () => {
+    const lt = doses.length ? doses[doses.length - 1].time + 2 : 10;
+    setDoses([...doses, { time: Math.min(lt, 23), mg: 95, type: "coffee" }]);
+  };
+
+  const resetAll = () => {
+    if (confirm("Reset all doses and settings?")) {
+      setDoses([{ time: 8.5, mg: 95, type: "coffee" }]);
+      setPS(9); setPE(17); setST(23);
+    }
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", padding: "clamp(16px, 4vw, 48px) clamp(12px, 3vw, 32px)", display: "flex", justifyContent: "center" }}>
+      <div style={{ width: "100%", maxWidth: "900px" }}>
+
+        {/* Header */}
+        <header className="fade-up" style={{ marginBottom: "32px" }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: "14px", flexWrap: "wrap" }}>
+            <h1 style={{
+              fontFamily: "var(--serif)", fontWeight: 500, fontSize: "clamp(32px, 7vw, 56px)",
+              margin: 0, letterSpacing: "-0.02em", lineHeight: 1
+            }}>
+              Caffeine<span style={{ color: "var(--accent)" }}>.</span>
+            </h1>
+            <span style={{
+              fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.2em",
+              color: "var(--ink-soft)", fontWeight: 500, fontFamily: "var(--mono)"
+            }}>
+              scheduling, simulated
+            </span>
+          </div>
+          <p style={{
+            fontFamily: "var(--serif)", fontStyle: "italic", fontWeight: 400,
+            fontSize: "clamp(15px, 2.5vw, 18px)", color: "var(--ink-dim)",
+            margin: "10px 0 0", maxWidth: "560px", lineHeight: 1.5
+          }}>
+            Plan your day's doses. See when you peak, when you crash, and when it's safe to sleep.
+          </p>
+        </header>
+
+        {/* Hero verdict */}
+        <div className="fade-up" style={{
+          background: "linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%)",
+          border: "1px solid var(--line-2)",
+          borderRadius: "var(--r-lg)",
+          padding: "clamp(20px, 4vw, 32px)",
+          marginBottom: "20px",
+          position: "relative",
+          overflow: "hidden",
+          animationDelay: "0.05s"
+        }}>
+          <div style={{
+            position: "absolute", top: 0, right: 0, width: "240px", height: "240px",
+            background: `radial-gradient(circle, ${verdictTone === "good" ? "rgba(111,201,165,0.12)" : verdictTone === "warn" ? "rgba(232,154,79,0.12)" : "rgba(232,114,114,0.12)"} 0%, transparent 70%)`,
+            pointerEvents: "none"
+          }} />
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))",
+            gap: "24px",
+            position: "relative"
+          }}>
+            <HeroStat
+              label="Verdict"
+              value={verdict}
+              tone={verdictTone}
+              big
+              dot
+            />
+            <HeroStat
+              label="Safe to sleep"
+              value={clearTime ? fmtTime(clearTime) : "—"}
+              tone={sleepOk ? "good" : "bad"}
+              mono
+            />
+            <HeroStat
+              label="Daily total"
+              value={`${total} mg`}
+              sub={`of ${DAILY_LIMIT} mg`}
+              tone={totalOk ? "neutral" : "warn"}
+              bar={{ value: Math.min(total, DAILY_LIMIT*1.5), max: DAILY_LIMIT }}
+            />
+            <HeroStat
+              label="Peak avg"
+              value={`${Math.round(peakAvg)} mg`}
+              sub={`${fmtTime(pS, true)}—${fmtTime(pE, true)}`}
+              tone="neutral"
+            />
+          </div>
+        </div>
+
+        {/* Chart */}
+        <div className="fade-up" style={{
+          background: "var(--surface)",
+          border: "1px solid var(--line)",
+          borderRadius: "var(--r-lg)",
+          padding: "20px 8px 12px",
+          marginBottom: "20px",
+          animationDelay: "0.1s"
+        }}>
+          <div style={{ padding: "0 12px 8px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px" }}>
+            <span style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.15em", color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
+              Blood caffeine · mg
+            </span>
+            <Legend />
+          </div>
+          <Chart doses={doses} pS={pS} pE={pE} sT={sT} clearTime={clearTime} />
+        </div>
+
+        {/* Tips */}
+        {tips.length > 0 && (
+          <div className="fade-up" style={{ marginBottom: "20px", display: "flex", flexDirection: "column", gap: "8px", animationDelay: "0.15s" }}>
+            {tips.map((t, i) => (
+              <div key={i} style={{
+                display: "flex", gap: "12px", alignItems: "flex-start",
+                padding: "12px 16px",
+                background: t.tone === "good" ? "rgba(111,201,165,0.06)" : t.tone === "warn" ? "rgba(232,154,79,0.06)" : "rgba(232,114,114,0.06)",
+                border: `1px solid ${t.tone === "good" ? "rgba(111,201,165,0.2)" : t.tone === "warn" ? "rgba(232,154,79,0.2)" : "rgba(232,114,114,0.2)"}`,
+                borderRadius: "var(--r)",
+                fontSize: "14px",
+                lineHeight: 1.5,
+                color: "var(--ink)"
+              }}>
+                <span style={{
+                  width: "18px", height: "18px", flexShrink: 0, marginTop: "1px",
+                  borderRadius: "50%",
+                  background: t.tone === "good" ? "var(--good)" : t.tone === "warn" ? "var(--warn)" : "var(--bad)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: "11px", fontWeight: 700, color: "var(--bg)"
+                }}>{t.tone === "good" ? "✓" : "!"}</span>
+                {t.text}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Doses */}
+        <Section title="Your doses" count={doses.length}>
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {doses.map((d, i) => (
+              <DoseRow
+                key={i}
+                index={i}
+                dose={d}
+                onChange={patch => updateDose(i, patch)}
+                onRemove={doses.length > 1 ? () => removeDose(i) : null}
+              />
+            ))}
+          </div>
+          <button onClick={addDose} style={{
+            marginTop: "12px",
+            width: "100%",
+            padding: "12px",
+            borderRadius: "var(--r)",
+            border: "1px dashed var(--line-2)",
+            background: "transparent",
+            color: "var(--accent)",
+            cursor: "pointer",
+            fontSize: "14px",
+            fontWeight: 500,
+            transition: "all 0.15s ease"
+          }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.background = "rgba(201,168,107,0.05)"; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line-2)"; e.currentTarget.style.background = "transparent"; }}
+          >
+            + Add dose
+          </button>
+        </Section>
+
+        {/* Schedule */}
+        <Section title="Your schedule">
+          <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+            <ScheduleRow label="Peak window starts"  hint="When alertness matters most" value={pS} setValue={setPS} min={6}  max={23} />
+            <ScheduleRow label="Peak window ends"    value={pE} setValue={setPE} min={6}  max={25} />
+            <ScheduleRow label="Target bedtime"      hint="Caffeine should be below 50 mg by now" value={sT} setValue={setST} min={20} max={28} />
+          </div>
+        </Section>
+
+        {/* Footer */}
+        <footer style={{
+          marginTop: "32px",
+          paddingTop: "24px",
+          borderTop: "1px solid var(--line)",
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          flexWrap: "wrap", gap: "12px",
+          fontSize: "12px", color: "var(--ink-soft)",
+          fontFamily: "var(--mono)"
+        }}>
+          <div style={{ display: "flex", gap: "16px", flexWrap: "wrap" }}>
+            <span>Half-life: {HL}h · Model: exponential decay</span>
+            <span>Made with {"<3"} by Atomic</span>
+          </div>
+          <button onClick={resetAll} style={{
+            background: "transparent",
+            border: "1px solid var(--line)",
+            color: "var(--ink-dim)",
+            padding: "6px 14px",
+            borderRadius: "var(--r-sm)",
+            fontSize: "12px",
+            fontFamily: "var(--mono)",
+            cursor: "pointer",
+            transition: "all 0.15s ease"
+          }}
+          onMouseEnter={e => { e.currentTarget.style.color = "var(--bad)"; e.currentTarget.style.borderColor = "var(--bad)"; }}
+          onMouseLeave={e => { e.currentTarget.style.color = "var(--ink-dim)"; e.currentTarget.style.borderColor = "var(--line)"; }}
+          >
+            Reset all
+          </button>
+        </footer>
+
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Sub-components ---------- */
+
+function HeroStat({ label, value, tone, big, mono, dot, sub, bar }) {
+  const color =
+    tone === "good" ? "var(--good)" :
+    tone === "warn" ? "var(--warn)" :
+    tone === "bad"  ? "var(--bad)"  : "var(--ink)";
+  return (
+    <div>
+      <div style={{
+        fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.15em",
+        color: "var(--ink-soft)", fontFamily: "var(--mono)", marginBottom: "8px",
+        display: "flex", alignItems: "center", gap: "8px"
+      }}>
+        {dot && (
+          <span style={{
+            width: "7px", height: "7px", borderRadius: "50%", background: color,
+            animation: tone === "good" ? "pulse-dot 2s ease-in-out infinite" : "none"
+          }} />
+        )}
+        {label}
+      </div>
+      <div style={{
+        fontFamily: big ? "var(--serif)" : mono ? "var(--mono)" : "var(--sans)",
+        fontWeight: big ? 500 : mono ? 500 : 600,
+        fontSize: big ? "clamp(26px, 4.5vw, 36px)" : "clamp(20px, 3.5vw, 26px)",
+        color,
+        lineHeight: 1.1,
+        letterSpacing: big ? "-0.02em" : "-0.01em"
+      }}>
+        {value}
+      </div>
+      {sub && (
+        <div style={{ fontSize: "12px", color: "var(--ink-soft)", marginTop: "4px", fontFamily: "var(--mono)" }}>
+          {sub}
+        </div>
+      )}
+      {bar && (
+        <div style={{
+          height: "3px", background: "rgba(255,255,255,0.06)", borderRadius: "999px",
+          marginTop: "10px", overflow: "hidden"
+        }}>
+          <div style={{
+            width: `${Math.min(100, (bar.value / bar.max) * 100)}%`,
+            height: "100%",
+            background: bar.value > bar.max ? "var(--warn)" : "var(--accent)",
+            borderRadius: "999px",
+            transition: "width 0.3s ease"
+          }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Section({ title, count, children }) {
+  return (
+    <section className="fade-up" style={{
+      background: "var(--surface)",
+      border: "1px solid var(--line)",
+      borderRadius: "var(--r-lg)",
+      padding: "clamp(16px, 3vw, 24px)",
+      marginBottom: "16px",
+      animationDelay: "0.2s"
+    }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: "10px", marginBottom: "16px" }}>
+        <h2 style={{
+          fontFamily: "var(--serif)", fontWeight: 500, fontSize: "20px",
+          margin: 0, letterSpacing: "-0.01em"
+        }}>{title}</h2>
+        {count != null && (
+          <span style={{
+            fontSize: "11px", color: "var(--ink-soft)", fontFamily: "var(--mono)",
+            fontWeight: 500, letterSpacing: "0.1em"
+          }}>
+            {count}
+          </span>
+        )}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function DoseRow({ index, dose, onChange, onRemove }) {
+  const timeStr = hoursToHHMM(dose.time);
+
+  return (
+    <div style={{
+      background: "var(--surface-2)",
+      border: "1px solid var(--line)",
+      borderRadius: "var(--r)",
+      padding: "14px 16px",
+      display: "flex",
+      flexDirection: "column",
+      gap: "12px",
+      transition: "border-color 0.15s ease"
+    }}>
+      {/* Top row: badge + select + remove */}
+      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+        <div style={{
+          width: "26px", height: "26px", borderRadius: "50%",
+          background: "linear-gradient(135deg, var(--accent) 0%, #a88b50 100%)",
+          color: "var(--bg)", fontSize: "12px", fontWeight: 700,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontFamily: "var(--mono)",
+          flexShrink: 0
+        }}>{index + 1}</div>
+
+        <select
+          value={dose.type}
+          onChange={e => {
+            const t = e.target.value;
+            const base = DRINKS[t];
+            onChange({ type: t, mg: t === "custom" ? dose.mg : base.mg });
+          }}
+          style={{ flex: 1, minWidth: 0 }}
+          aria-label={`Drink type for dose ${index + 1}`}
+        >
+          {Object.entries(DRINKS).map(([k, v]) => (
+            <option key={k} value={k}>{v.icon}  {v.label}</option>
+          ))}
+        </select>
+
+        {onRemove && (
+          <button onClick={onRemove} style={{
+            width: "32px", height: "32px", borderRadius: "8px",
+            border: "1px solid var(--line)", background: "transparent",
+            color: "var(--ink-soft)", cursor: "pointer", fontSize: "14px",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "all 0.15s ease",
+            flexShrink: 0
+          }}
+          onMouseEnter={e => { e.currentTarget.style.color = "var(--bad)"; e.currentTarget.style.borderColor = "var(--bad)"; }}
+          onMouseLeave={e => { e.currentTarget.style.color = "var(--ink-soft)"; e.currentTarget.style.borderColor = "var(--line)"; }}
+          aria-label={`Remove dose ${index + 1}`}
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
+      {/* Bottom row: time + amount side by side */}
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "minmax(130px, 1fr) minmax(0, 1.3fr)",
+        gap: "12px",
+        alignItems: "end"
+      }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+          <label style={{
+            fontSize: "10px", color: "var(--ink-soft)", textTransform: "uppercase",
+            letterSpacing: "0.15em", fontFamily: "var(--mono)", fontWeight: 500
+          }}>Time</label>
+          <input
+            type="time"
+            value={timeStr}
+            onChange={e => onChange({ time: hhmmToHours(e.target.value) })}
+            style={{ width: "100%" }}
+            aria-label={`Time for dose ${index + 1}`}
+          />
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+          <label style={{
+            fontSize: "10px", color: "var(--ink-soft)", textTransform: "uppercase",
+            letterSpacing: "0.15em", fontFamily: "var(--mono)", fontWeight: 500,
+            display: "flex", justifyContent: "space-between", alignItems: "baseline"
+          }}>
+            <span>Amount</span>
+            <span style={{
+              color: "var(--accent)", fontWeight: 600, fontSize: "13px",
+              letterSpacing: "normal", textTransform: "none"
+            }}>{dose.mg} mg</span>
+          </label>
+          <input
+            type="range"
+            min={10} max={400} step={5}
+            value={dose.mg}
+            onChange={e => onChange({ mg: parseInt(e.target.value), type: "custom" })}
+            style={{ "--pct": `${((dose.mg - 10) / 390) * 100}%` }}
+            aria-label={`Amount in mg for dose ${index + 1}`}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScheduleRow({ label, hint, value, setValue, min, max }) {
+  const pct = ((value - min) / (max - min)) * 100;
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "minmax(0, 1fr) auto",
+      gap: "4px 16px",
+      alignItems: "center"
+    }}>
+      <div>
+        <div style={{ fontSize: "14px", fontWeight: 500, color: "var(--ink)" }}>{label}</div>
+        {hint && <div style={{ fontSize: "12px", color: "var(--ink-soft)", marginTop: "2px" }}>{hint}</div>}
+      </div>
+      <div style={{
+        fontFamily: "var(--mono)", fontSize: "14px", fontWeight: 600,
+        color: "var(--accent)", minWidth: "90px", textAlign: "right"
+      }}>
+        {fmtTime(value, true)}{value >= 24 ? " +1d" : ""}
+      </div>
+      <input
+        type="range"
+        min={min} max={max} step={0.25}
+        value={value}
+        onChange={e => setValue(parseFloat(e.target.value))}
+        style={{ gridColumn: "1 / -1", "--pct": `${pct}%` }}
+      />
+    </div>
+  );
+}
+
+function Legend() {
+  const items = [
+    { c: "var(--accent)", l: "Caffeine" },
+    { c: "rgba(111,201,165,0.4)", l: "Peak window", sq: true },
+    { c: "rgba(232,114,114,0.4)", l: "Sleep window", sq: true },
+    { c: "var(--good)", l: "Safe marker", dot: true },
+  ];
+  return (
+    <div style={{ display: "flex", gap: "14px", flexWrap: "wrap", fontSize: "11px", color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
+      {items.map((it, i) => (
+        <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+          <span style={{
+            width: "10px", height: it.sq ? "10px" : (it.dot ? "8px" : "2px"),
+            borderRadius: it.dot ? "50%" : "2px",
+            background: it.c,
+            display: "inline-block"
+          }} />
+          {it.l}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
