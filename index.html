@@ -482,8 +482,11 @@ function App() {
   const clearTime = useMemo(() => {
     if (!doses.length) return null;
     const maxDoseTime = Math.max(...doses.map(d => d.time));
-    for (let t = 6; t <= 72; t += 0.1) {
-      if (t >= maxDoseTime && caffeineAt(t, doses) < SLEEP_THRESHOLD) return t;
+    // Start scanning AFTER the last dose has fully absorbed (+0.75h absorption window)
+    // so we don't mistake the pre-dose trough for "clear"
+    const scanStart = maxDoseTime + 0.75;
+    for (let t = scanStart; t <= 72; t += 0.1) {
+      if (caffeineAt(t, doses) < SLEEP_THRESHOLD) return t;
     }
     return null;
   }, [doses]);
@@ -499,15 +502,22 @@ function App() {
   if (!totalOk) tips.push({ tone: "warn", text: `${total} mg total exceeds the 400 mg daily guideline.` });
   if (peakAvg < 50 && doses.length > 0) tips.push({ tone: "warn", text: `Peak alertness average is only ${Math.round(peakAvg)} mg — consider an earlier dose.` });
 
-  // daytime dip detection (between doses)
-  if (doses.length >= 1) {
-    const dips = [];
-    for (let t = Math.max(8, Math.min(...doses.map(d=>d.time))+1); t <= 18; t += 0.5) {
-      dips.push({ t, v: caffeineAt(t, doses) });
-    }
-    if (dips.length > 4) {
-      const low = dips.reduce((a,b) => a.v < b.v ? a : b);
-      if (low.v < 30) tips.push({ tone: "warn", text: `Afternoon dip around ${fmtTime(low.t, true)} (~${Math.round(low.v)} mg).` });
+  // daytime dip detection — only scan gaps between consecutive doses
+  if (doses.length >= 2) {
+    const sorted = [...doses].sort((a,b) => a.time - b.time);
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const gapStart = sorted[i].time + 1;       // 1h after dose (past peak)
+      const gapEnd   = sorted[i+1].time - 0.25;  // stop before next dose starts absorbing
+      if (gapEnd - gapStart < 1) continue;       // too narrow, skip
+      let low = { v: 999, t: gapStart };
+      for (let t = gapStart; t <= gapEnd; t += 0.25) {
+        const v = caffeineAt(t, doses);
+        if (v < low.v) low = { t, v };
+      }
+      if (low.v < 30) {
+        tips.push({ tone: "warn", text: `Afternoon dip around ${fmtTime(low.t, true)} (~${Math.round(low.v)} mg).` });
+        break; // only report the worst/first dip
+      }
     }
   }
 
