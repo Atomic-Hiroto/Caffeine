@@ -411,7 +411,7 @@ const allocateMg = (times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, r
    - Uses smart init (multi-start on dose-time configurations with analytical mg allocator),
      then simulated annealing to fine-tune. */
 const optimizeDoses = ({
-  nNew, pS, pE, sT, respectSleep, capTotal, seedDoses, lockedDoses
+  nNew, pS, pE, sT, respectSleep, capTotal, seedDoses, lockedDoses, earliestTime
 }) => {
   const N = Math.max(1, Math.min(8, nNew | 0));
   const locked = lockedDoses || [];
@@ -420,7 +420,7 @@ const optimizeDoses = ({
   const lockedSleep = locked.reduce((a, d) => a + d.mg * sleepCoefAt(d.time, sT), 0);
   const totalBudget = Math.max(0, TOTAL_CAP_RAW - lockedTotal);
   const sleepBudget = Math.max(0, SLEEP_THRESHOLD - lockedSleep);
-  const tMin = Math.max(4, pS - 2);
+  const tMin = Math.max(4, pS - 2, earliestTime ?? 0);
   const tMax = Math.max(pS + 0.5, sT - 0.25);
   const mgMin = 10, mgMax = 300;
   const clamp = (v, mn, mx) => Math.max(mn, Math.min(mx, v));
@@ -565,7 +565,7 @@ function useAnimatedNumber(target, duration = 500) {
 }
 
 /* ---------- Chart ---------- */
-function Chart({ doses, pS, pE, sT, clearTime }) {
+function Chart({ doses, pS, pE, sT, clearTime, nowHour, showNow }) {
   const ref = useRef(null);
   const [hover, setHover] = useState(null);
   const [dims, setDims] = useState({ W: 0, H: 0 });
@@ -712,6 +712,27 @@ function Chart({ doses, pS, pE, sT, clearTime }) {
       }
     }
 
+    // "Now" line
+    if (showNow && nowHour >= 6 && nowHour <= eT) {
+      const nx = xO(nowHour);
+      ctx.setLineDash([3, 5]);
+      ctx.strokeStyle = "rgba(243,238,228,0.25)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(nx, p.t);
+      ctx.lineTo(nx, p.t + cH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(243,238,228,0.55)";
+      ctx.font = "600 9px 'JetBrains Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("NOW", nx, p.t - 5);
+      ctx.beginPath();
+      ctx.arc(nx, p.t, 3, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(243,238,228,0.7)";
+      ctx.fill();
+    }
+
     // Axis labels
     ctx.fillStyle = "rgba(166,157,176,0.7)";
     ctx.font = "500 10px 'DM Sans', sans-serif";
@@ -768,7 +789,7 @@ function Chart({ doses, pS, pE, sT, clearTime }) {
       ctx.textAlign = "left";
       ctx.fillText(label, bx + 8, by + 15);
     }
-  }, [doses, pS, pE, sT, clearTime]);
+  }, [doses, pS, pE, sT, clearTime, nowHour, showNow]);
 
   useEffect(() => { hoverRef.current = hover; }, [hover]);
 
@@ -834,8 +855,17 @@ function Chart({ doses, pS, pE, sT, clearTime }) {
   );
 }
 
+const getNow = () => { const d = new Date(); return d.getHours() + d.getMinutes() / 60; };
+
 /* ---------- App ---------- */
 function App() {
+  /* Live time — ticks every minute */
+  const [nowHour, setNowHour] = useState(getNow);
+  useEffect(() => {
+    const id = setInterval(() => setNowHour(getNow()), 60000);
+    return () => clearInterval(id);
+  }, []);
+
   const [doses, setDoses] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.doses);
@@ -902,6 +932,7 @@ function App() {
     else if (clearTime) t.push({ tone: "good", text: `You'll be safe to sleep by ${fmtTime(clearTime)}.` });
     if (!totalOk) t.push({ tone: "warn", text: `${total} mg total exceeds the 400 mg daily guideline.` });
     if (peakAvg < 50 && doses.length > 0) t.push({ tone: "warn", text: `Peak alertness average is only ${Math.round(peakAvg)} mg — consider an earlier dose.` });
+    if (planToday && nowHour > pE) t.push({ tone: "warn", text: `Your peak window has already passed today. Update your schedule or plan for tomorrow.` });
 
     if (doses.length >= 2) {
       const sorted = [...doses].sort((a,b) => a.time - b.time);
@@ -921,7 +952,7 @@ function App() {
       }
     }
     return t;
-  }, [doses, sleepOk, clearTime, totalOk, total, peakAvg]);
+  }, [doses, sleepOk, clearTime, totalOk, total, peakAvg, planToday, nowHour, pE]);
 
   const updateDose = (i, patch) => {
     const a = [...doses];
@@ -948,6 +979,7 @@ function App() {
   const lockedCount = doses.length - unlockedCount;
   const [respectSleep, setRespectSleep] = useState(true);
   const [capTotal, setCapTotal] = useState(true);
+  const [planToday, setPlanToday] = useState(true);
   const [targetDoseCount, setTargetDoseCount] = useState(Math.max(1, unlockedCount));
   const [prevDoses, setPrevDoses] = useState(null);
   const [lastOpt, setLastOpt] = useState(null);
@@ -959,14 +991,19 @@ function App() {
     setOptimizing(true);
     const beforeAvg = peakAvg;
     const beforeSleep = caffeineAt(sT, doses);
-    const lockedDoses = doses.filter(d => d.locked);
-    const unlockedDoses = doses.filter(d => !d.locked);
+    // When planning for today, doses already consumed (time < now) are fixed context
+    const effectiveLocked = planToday
+      ? doses.filter(d => d.locked || d.time < nowHour)
+      : doses.filter(d => d.locked);
+    const effectiveUnlocked = doses.filter(d => !d.locked && !(planToday && d.time < nowHour));
+    const earliestNew = planToday ? nowHour + 0.25 : undefined;
     requestAnimationFrame(() => {
       const optimized = optimizeDoses({
         nNew: targetDoseCount,
         pS, pE, sT, respectSleep, capTotal,
-        seedDoses: targetDoseCount === unlockedDoses.length ? unlockedDoses : null,
-        lockedDoses,
+        seedDoses: targetDoseCount === effectiveUnlocked.length ? effectiveUnlocked : null,
+        lockedDoses: effectiveLocked,
+        earliestTime: earliestNew,
       });
       const merged = [...lockedDoses, ...optimized].sort((a, b) => a.time - b.time);
       setPrevDoses(doses);
@@ -1082,9 +1119,9 @@ function App() {
             <span style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.15em", color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
               Blood caffeine · mg
             </span>
-            <Legend />
+            <Legend showNow={planToday} />
           </div>
-          <Chart doses={doses} pS={pS} pE={pE} sT={sT} clearTime={clearTime} />
+          <Chart doses={doses} pS={pS} pE={pE} sT={sT} clearTime={clearTime} nowHour={nowHour} showNow={planToday} />
         </div>
 
         {/* Tips */}
@@ -1127,6 +1164,7 @@ function App() {
                 onRemove={() => removeDose(i)}
                 isOnlyDose={doses.length === 1}
                 enterDelay={i * 0.04}
+                isPast={planToday && d.time < nowHour}
               />
             ))}
           </div>
@@ -1199,6 +1237,12 @@ function App() {
               hint={`Stay under ${DAILY_LIMIT} mg total`}
               checked={capTotal}
               onChange={setCapTotal}
+            />
+            <OptimizerToggle
+              label="Plan for today"
+              hint={`Only place doses after ${fmtTime(nowHour, true)}`}
+              checked={planToday}
+              onChange={setPlanToday}
             />
           </div>
 
@@ -1494,7 +1538,7 @@ function OptimizerToggle({ label, hint, checked, onChange }) {
   );
 }
 
-function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }) {
+function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0, isPast = false }) {
   const [draftMg, setDraftMg] = useState(dose.mg);
   const [draftTime, setDraftTime] = useState(dose.time);
   useEffect(() => { setDraftMg(dose.mg); }, [dose.mg]);
@@ -1523,8 +1567,12 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
 
   return (
     <div className="dose-card slide-in" style={{
-      background: locked ? "rgba(201,168,107,0.05)" : "var(--surface-2)",
-      border: `1px solid ${locked ? "rgba(201,168,107,0.3)" : "var(--line)"}`,
+      background: locked
+        ? "rgba(201,168,107,0.05)"
+        : isPast
+          ? "rgba(201,168,107,0.03)"
+          : "var(--surface-2)",
+      border: `1px solid ${locked ? "rgba(201,168,107,0.3)" : isPast ? "rgba(201,168,107,0.18)" : "var(--line)"}`,
       borderRadius: "var(--r)",
       padding: "14px 16px",
       display: "flex",
@@ -1537,12 +1585,25 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
         <div style={{
           width: "26px", height: "26px", borderRadius: "50%",
-          background: "linear-gradient(135deg, var(--accent) 0%, #a88b50 100%)",
+          background: isPast
+            ? "linear-gradient(135deg, rgba(201,168,107,0.5) 0%, rgba(168,139,80,0.5) 100%)"
+            : "linear-gradient(135deg, var(--accent) 0%, #a88b50 100%)",
           color: "var(--bg)", fontSize: "12px", fontWeight: 700,
           display: "flex", alignItems: "center", justifyContent: "center",
           fontFamily: "var(--mono)",
           flexShrink: 0
         }}>{index + 1}</div>
+        {isPast && (
+          <span style={{
+            fontSize: "9px", fontFamily: "var(--mono)", fontWeight: 600,
+            letterSpacing: "0.1em", textTransform: "uppercase",
+            background: "rgba(201,168,107,0.15)",
+            color: "var(--accent)",
+            padding: "2px 7px", borderRadius: "999px",
+            border: "1px solid rgba(201,168,107,0.3)",
+            flexShrink: 0
+          }}>consumed</span>
+        )}
 
         <select
           value={dose.type}
@@ -1712,23 +1773,27 @@ function ScheduleRow({ label, hint, value, setValue, min, max }) {
   );
 }
 
-function Legend() {
+function Legend({ showNow }) {
   const items = [
     { c: "var(--accent)", l: "Caffeine" },
     { c: "rgba(111,201,165,0.4)", l: "Peak window", sq: true },
     { c: "rgba(232,114,114,0.4)", l: "Sleep window", sq: true },
     { c: "var(--good)", l: "Safe marker", dot: true },
+    ...(showNow ? [{ c: "rgba(243,238,228,0.55)", l: "Now", dash: true }] : []),
   ];
   return (
     <div style={{ display: "flex", gap: "14px", flexWrap: "wrap", fontSize: "11px", color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
       {items.map((it, i) => (
         <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-          <span style={{
-            width: "10px", height: it.sq ? "10px" : (it.dot ? "8px" : "2px"),
-            borderRadius: it.dot ? "50%" : "2px",
-            background: it.c,
-            display: "inline-block"
-          }} />
+          {it.dash
+            ? <span style={{ width: "12px", borderBottom: `2px dashed ${it.c}`, display: "inline-block" }} />
+            : <span style={{
+                width: "10px", height: it.sq ? "10px" : (it.dot ? "8px" : "2px"),
+                borderRadius: it.dot ? "50%" : "2px",
+                background: it.c,
+                display: "inline-block"
+              }} />
+          }
           {it.l}
         </span>
       ))}
