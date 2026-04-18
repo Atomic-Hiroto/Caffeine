@@ -359,57 +359,101 @@ const sleepCoefAt = (doseTime, sT) => {
   return Math.min(1, el / 0.75) * Math.pow(0.5, el / HL);
 };
 
-/* Greedy water-filling mg allocator for a fixed set of dose times.
-   Objective: maximize Σ c_i m_i subject to Σ m_i ≤ totalBudget,
-   Σ s_i m_i ≤ sleepBudget, mgMin ≤ m_i ≤ mgMax.
-   Handles contribution from locked doses as pre-consumed budget.
-   Returns mg[] of same length as times. */
+/* Exact LP mg allocator via vertex enumeration.
+   Maximize Σ c_i m_i s.t.
+     mgMin ≤ m_i ≤ mgMax,
+     Σ m_i ≤ totalBudget,
+     Σ s_i m_i ≤ sleepBudget  (only if respectSleep).
+   At an LP optimum, at least N of (2N box + up to 2 resource) constraints are tight,
+   so at most 2 variables are interior. We enumerate all such vertices exactly.
+   For N ≤ 8 this is ≤ ~4100 candidates — instant and deterministic. */
 const allocateMg = (times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep) => {
   const N = times.length;
   if (N === 0) return [];
   const c = times.map(t => peakCoefAt(t, pS, pE));
   const s = times.map(t => sleepCoefAt(t, sT));
+  const EPS = 1e-6;
 
-  // Start at minimum allocation
-  const mg = new Array(N).fill(mgMin);
-  let totalUsed = mgMin * N;
-  let sleepUsed = mg.reduce((a, v, i) => a + v * s[i], 0);
-
-  // If even the minimum violates, there's nothing we can do — return minimums
-  if (totalUsed > totalBudget) return mg;
-
-  // Rank doses: a dose that gives a lot of peak per sleep-cost wins first if sleep is binding
-  // Otherwise, just by peak coefficient
-  const order = Array.from({ length: N }, (_, i) => i);
-  const rank = i => {
-    if (!respectSleep) return c[i];
-    if (s[i] <= 1e-6) return c[i] * 1e6; // essentially free for sleep
-    return c[i] / Math.max(s[i], 0.01);
+  const feasible = (mg) => {
+    let tot = 0, sl = 0;
+    for (let i = 0; i < N; i++) {
+      if (mg[i] < mgMin - EPS || mg[i] > mgMax + EPS) return false;
+      tot += mg[i]; sl += s[i] * mg[i];
+    }
+    if (tot > totalBudget + EPS) return false;
+    if (respectSleep && sl > sleepBudget + EPS) return false;
+    return true;
   };
-  order.sort((a, b) => rank(b) - rank(a));
+  const objective = (mg) => { let v = 0; for (let i = 0; i < N; i++) v += c[i] * mg[i]; return v; };
 
-  // Distribute budget to top-ranked doses
-  for (const i of order) {
-    const maxAddByTotal = totalBudget - totalUsed;
-    const maxAddBySleep = respectSleep
-      ? (s[i] > 1e-6 ? Math.max(0, (sleepBudget - sleepUsed) / s[i]) : Infinity)
-      : Infinity;
-    const maxAddByBox = mgMax - mg[i];
-    const add = Math.max(0, Math.min(maxAddByTotal, maxAddBySleep, maxAddByBox));
-    mg[i] += add;
-    totalUsed += add;
-    sleepUsed += add * s[i];
-    if (totalUsed >= totalBudget - 1e-6) break;
+  let bestMg = new Array(N).fill(mgMin), bestObj = -Infinity;
+  if (feasible(bestMg)) bestObj = objective(bestMg);
+
+  const tryVertex = (mg) => {
+    if (!feasible(mg)) return;
+    const obj = objective(mg);
+    if (obj > bestObj) { bestObj = obj; bestMg = mg.slice(); }
+  };
+
+  // Enumerate basicMask (bits for variables at interior values) and for each
+  // non-basic variable, pick mgMin or mgMax. Solve the linear system imposed
+  // by which resource constraints are active (must equal number of basics).
+  const maxK = 1 + (respectSleep ? 1 : 0); // up to 2 resource constraints
+  for (let basicMask = 0; basicMask < (1 << N); basicMask++) {
+    const basicIdx = [];
+    for (let i = 0; i < N; i++) if (basicMask & (1 << i)) basicIdx.push(i);
+    const k = basicIdx.length;
+    if (k > maxK) continue;
+
+    const nonBasic = [];
+    for (let i = 0; i < N; i++) if (!(basicMask & (1 << i))) nonBasic.push(i);
+    const nb = nonBasic.length;
+
+    for (let bm = 0; bm < (1 << nb); bm++) {
+      const mg = new Array(N);
+      for (let j = 0; j < nb; j++) mg[nonBasic[j]] = (bm & (1 << j)) ? mgMax : mgMin;
+
+      if (k === 0) {
+        // All vars at bounds — pure corner
+        for (const i of basicIdx) mg[i] = mgMin; // unused
+        tryVertex(mg);
+        continue;
+      }
+
+      // Active-constraint pairs: total=T, sleep=S. Need k active constraints.
+      const active = respectSleep ? (k === 2 ? [["T", "S"]] : [["T"], ["S"]]) : [["T"]];
+      for (const combo of active) {
+        // Build k×k system on basic variables
+        if (k === 1) {
+          const a = combo[0] === "T" ? 1 : s[basicIdx[0]];
+          if (Math.abs(a) < 1e-9) continue;
+          let rhs = combo[0] === "T" ? totalBudget : sleepBudget;
+          for (const j of nonBasic) rhs -= (combo[0] === "T" ? 1 : s[j]) * mg[j];
+          mg[basicIdx[0]] = rhs / a;
+        } else {
+          // k === 2, combo = ["T","S"]
+          const i1 = basicIdx[0], i2 = basicIdx[1];
+          const a = 1,            b = 1;
+          const c2 = s[i1],       d = s[i2];
+          let r0 = totalBudget, r1 = sleepBudget;
+          for (const j of nonBasic) { r0 -= mg[j]; r1 -= s[j] * mg[j]; }
+          const det = a * d - b * c2;
+          if (Math.abs(det) < 1e-9) continue;
+          mg[i1] = (d * r0 - b * r1) / det;
+          mg[i2] = (a * r1 - c2 * r0) / det;
+        }
+        tryVertex(mg);
+      }
+    }
   }
-
-  return mg;
+  return bestMg;
 };
 
-/* Main optimizer.
+/* Main optimizer. Deterministic — same inputs produce the same output.
    - `lockedDoses` are fixed and contribute to peak + sleep + total budgets.
    - Produces `nNew` optimized doses (times + mg).
-   - Uses smart init (multi-start on dose-time configurations with analytical mg allocator),
-     then simulated annealing to fine-tune. */
+   - Grid-search (15-min) over time configs + exact LP mg allocation per config,
+     then coordinate-descent refinement at 5-min resolution. */
 const optimizeDoses = ({
   nNew, pS, pE, sT, respectSleep, capTotal, seedDoses, lockedDoses, earliestTime
 }) => {
@@ -417,28 +461,39 @@ const optimizeDoses = ({
   const locked = lockedDoses || [];
   const TOTAL_CAP_RAW = capTotal ? DAILY_LIMIT : 800;
   const lockedTotal = locked.reduce((a, d) => a + d.mg, 0);
-  const lockedSleep = locked.reduce((a, d) => a + d.mg * sleepCoefAt(d.time, sT), 0);
+  const lockedSleepLevel = locked.length ? caffeineAt(sT, locked) : 0;
   const totalBudget = Math.max(0, TOTAL_CAP_RAW - lockedTotal);
-  const sleepBudget = Math.max(0, SLEEP_THRESHOLD - lockedSleep);
+  const sleepBudget = Math.max(0, SLEEP_THRESHOLD - lockedSleepLevel);
   const tMin = Math.max(4, pS - 2, earliestTime ?? 0);
-  const tMax = Math.max(pS + 0.5, sT - 0.25);
+  // Doses placed after the peak window contribute nothing to peak avg —
+  // never suggest them. Also cap before bedtime so caffeine can start clearing.
+  const tMax = Math.min(pE, sT - 0.5);
   const mgMin = 10, mgMax = 300;
   const clamp = (v, mn, mx) => Math.max(mn, Math.min(mx, v));
   const snapT = t => Math.round(t * 12) / 12;
   const snapM = m => Math.round(m / 5) * 5;
 
-  // Scoring evaluates locked + candidate combined curve over peak window
-  const peakAvgWithLocked = (cand) => {
-    const all = locked.concat(cand);
-    return peakAverage(all, pS, pE, 0.1);
-  };
+  // No valid window (peak window already passed, or bedtime too close)
+  if (tMin >= tMax - 0.1) {
+    return Array.from({ length: N }, (_, i) => ({
+      time: snapT(clamp(tMin + i * 0.25, tMin, tMin + N)),
+      mg: mgMin, type: "custom", locked: false,
+    }));
+  }
+
   const score = (cand) => {
     const all = locked.concat(cand);
     const peakAvg = peakAverage(all, pS, pE, 0.1);
     let penalty = 0;
     if (respectSleep) {
-      const sleep = caffeineAt(sT, all);
-      if (sleep > SLEEP_THRESHOLD) penalty += (sleep - SLEEP_THRESHOLD) ** 2 * 4;
+      // Only penalise the marginal sleep contribution from NEW doses,
+      // relative to whatever budget the locked doses left over.
+      // This prevents locked-dose over-runs from dominating and pushing
+      // the optimizer toward useless late placements.
+      const candSleep = caffeineAt(sT, cand);
+      const remaining = Math.max(0, SLEEP_THRESHOLD - lockedSleepLevel);
+      const excess = Math.max(0, candSleep - remaining);
+      penalty += excess ** 2 * 4;
     }
     const tot = all.reduce((a, d) => a + d.mg, 0);
     if (capTotal && tot > DAILY_LIMIT) penalty += (tot - DAILY_LIMIT) ** 2 * 1.5;
@@ -451,55 +506,65 @@ const optimizeDoses = ({
     return times.map((t, i) => ({ time: snapT(t), mg: snapM(mgs[i]) }));
   };
 
-  // --- Smart initialization: grid-search over dose-time configurations ---
-  // Time grid at 30-min resolution over [max(tMin, pS - 1), min(tMax, pE + 0.5)] focused around peak,
-  // plus a few earlier slots if peak starts late.
+  // --- Deterministic grid search over dose-time configurations ---
+  // 15-min resolution over [max(tMin, pS - 1.5), min(tMax, pE + 0.25)].
   const gridLo = Math.max(tMin, pS - 1.5);
   const gridHi = Math.min(tMax, pE + 0.25);
-  const gridStep = 0.5;
+  const gridStep = 0.25;
   const slots = [];
-  for (let t = gridLo; t <= gridHi + 1e-9; t += gridStep) slots.push(t);
-  // Include tMin and tMax as extra options so edges aren't missed
-  if (slots[0] > tMin) slots.unshift(tMin);
-  if (slots[slots.length - 1] < tMax) slots.push(tMax);
-
-  // Enumerate ordered combinations (with repetition disallowed) — cap total combos to ~4000
-  let combos = [];
-  const MAX_COMBOS = 4000;
-  const rec = (start, acc) => {
-    if (combos.length >= MAX_COMBOS) return;
-    if (acc.length === N) { combos.push(acc.slice()); return; }
-    for (let i = start; i < slots.length; i++) {
-      if (combos.length >= MAX_COMBOS) return;
-      acc.push(slots[i]);
-      rec(i + 1, acc);
-      acc.pop();
-    }
-  };
-  if (N <= 4) {
-    rec(0, []);
-  } else {
-    // Random sampling for larger N
-    for (let k = 0; k < MAX_COMBOS; k++) {
-      const picked = [];
-      const used = new Set();
-      while (picked.length < N) {
-        const j = Math.floor(Math.random() * slots.length);
-        if (!used.has(j)) { used.add(j); picked.push(slots[j]); }
-      }
-      picked.sort((a, b) => a - b);
-      combos.push(picked);
-    }
-  }
+  for (let t = gridLo; t <= gridHi + 1e-9; t += gridStep) slots.push(Math.round(t * 12) / 12);
+  if (slots.length === 0 || slots[0] > tMin + 1e-9) slots.unshift(tMin);
+  if (slots[slots.length - 1] < tMax - 1e-9) slots.push(tMax);
 
   let best = null, bestScore = -Infinity;
-  for (const times of combos) {
-    const cand = buildFromTimes(times);
-    const s = score(cand);
-    if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+  const MAX_COMBOS = 10000;
+
+  if (N <= 4) {
+    // Exhaustive enumeration of ordered combinations (no repeats)
+    let count = 0;
+    const acc = [];
+    const rec = (start) => {
+      if (count >= MAX_COMBOS) return;
+      if (acc.length === N) {
+        count++;
+        const cand = buildFromTimes(acc);
+        const s = score(cand);
+        if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+        return;
+      }
+      for (let i = start; i < slots.length; i++) {
+        if (count >= MAX_COMBOS) return;
+        acc.push(slots[i]);
+        rec(i + 1);
+        acc.pop();
+      }
+    };
+    rec(0);
+  } else {
+    // N > 4: stride through combinations with a step to keep count sane
+    const stride = Math.max(1, Math.ceil(Math.pow(slots.length, N / 4) / MAX_COMBOS));
+    const acc = [];
+    let count = 0;
+    const rec = (start) => {
+      if (count >= MAX_COMBOS) return;
+      if (acc.length === N) {
+        count++;
+        const cand = buildFromTimes(acc);
+        const s = score(cand);
+        if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+        return;
+      }
+      for (let i = start; i < slots.length; i += stride) {
+        if (count >= MAX_COMBOS) return;
+        acc.push(slots[i]);
+        rec(i + 1);
+        acc.pop();
+      }
+    };
+    rec(0);
   }
 
-  // Seed-dose: if the user already has N unlocked doses, include that config in evaluation
+  // Seed-dose: evaluate user's current config too
   if (seedDoses && seedDoses.length === N) {
     const seedTimes = seedDoses.map(d => snapT(clamp(d.time, tMin, tMax))).sort((a, b) => a - b);
     const cand = buildFromTimes(seedTimes);
@@ -507,34 +572,36 @@ const optimizeDoses = ({
     if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
   }
 
-  // --- Local refinement: simulated annealing around the best config ---
-  let current = best.map(x => ({ ...x }));
-  let curScore = bestScore;
-  const iters = 1500;
-  const T0 = 15;
-  for (let k = 0; k < iters; k++) {
-    const T = T0 * Math.pow(0.9975, k);
-    const cand = current.map(d => ({ ...d }));
-    const idx = Math.floor(Math.random() * N);
-    const roll = Math.random();
-    if (roll < 0.55) {
-      // Perturb time; reallocate mg analytically for new times
-      const span = 1.2 * (T / T0) + 0.15;
-      cand[idx].time = snapT(clamp(cand[idx].time + (Math.random() - 0.5) * 2 * span, tMin, tMax));
-      cand.sort((a, b) => a.time - b.time);
-      const mgs = allocateMg(cand.map(d => d.time), pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep);
-      cand.forEach((d, i) => { d.mg = snapM(mgs[i]); });
-    } else {
-      // Perturb mg directly
-      const span = 50 * (T / T0) + 8;
-      cand[idx].mg = snapM(clamp(cand[idx].mg + (Math.random() - 0.5) * 2 * span, mgMin, mgMax));
-    }
-    const s = score(cand);
-    const dS = s - curScore;
-    if (dS > 0 || Math.random() < Math.exp(dS / Math.max(T, 0.01))) {
-      current = cand;
-      curScore = s;
-      if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+  if (!best) {
+    // Degenerate fallback
+    best = Array.from({ length: N }, (_, i) => ({
+      time: snapT(clamp(tMin + i * 0.25, tMin, tMax)), mg: mgMin,
+    }));
+    bestScore = score(best);
+  }
+
+  // --- Deterministic coordinate descent refinement ---
+  // For each dose, try shifting its time by ±{5, 10, 15} minutes; recompute exact
+  // LP mg allocation; accept improvements. Iterate until no dose moves.
+  const fiveMin = 1 / 12;
+  const deltas = [-3, -2, -1, 1, 2, 3]; // ±5/10/15 min
+  let improved = true, guard = 0;
+  while (improved && guard++ < 50) {
+    improved = false;
+    for (let i = 0; i < N; i++) {
+      const origT = best[i].time;
+      for (const d of deltas) {
+        const newT = snapT(clamp(origT + d * fiveMin, tMin, tMax));
+        if (newT === origT) continue;
+        const times = best.map((x, j) => j === i ? newT : x.time).sort((a, b) => a - b);
+        const cand = buildFromTimes(times);
+        const sc = score(cand);
+        if (sc > bestScore + 1e-5) {
+          best = cand.map(x => ({ ...x }));
+          bestScore = sc;
+          improved = true;
+        }
+      }
     }
   }
 
