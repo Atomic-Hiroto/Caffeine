@@ -149,25 +149,112 @@
   select:focus, input[type=number]:focus, input[type=time]:focus {
     border-color: var(--accent);
     background: var(--surface);
+    box-shadow: 0 0 0 3px rgba(201,168,107,0.15);
+  }
+  input[type=range]:focus-visible {
+    outline: none;
+  }
+  input[type=range]:focus-visible::-webkit-slider-thumb {
+    box-shadow: 0 0 0 4px rgba(201,168,107,0.25), 0 2px 10px rgba(201,168,107,0.5);
   }
 
   /* Custom time input dark styling */
   input[type=time]::-webkit-calendar-picker-indicator {
     filter: invert(0.8);
     cursor: pointer;
+    transition: opacity 0.15s ease;
   }
+  input[type=time]::-webkit-calendar-picker-indicator:hover { opacity: 0.7; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--surface-2);
+    border-radius: 999px;
+    border: 2px solid var(--bg);
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--line-2); }
 
   ::selection { background: var(--accent); color: var(--bg); }
 
   @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(8px); }
+    from { opacity: 0; transform: translateY(12px); }
     to   { opacity: 1; transform: translateY(0); }
   }
-  .fade-up { animation: fadeUp 0.4s ease both; }
+  .fade-up { animation: fadeUp 0.55s cubic-bezier(.22,.61,.36,1) both; }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(6px) scale(0.985); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .slide-in { animation: slideIn 0.4s cubic-bezier(.22,.61,.36,1) both; }
 
   @keyframes pulse-dot {
     0%, 100% { box-shadow: 0 0 0 0 var(--good); }
     50% { box-shadow: 0 0 0 6px rgba(111,201,165,0); }
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  /* Interactive surfaces */
+  .dose-card {
+    transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+  }
+  .dose-card:hover {
+    border-color: var(--line-2);
+    transform: translateY(-1px);
+    box-shadow: 0 8px 24px -12px rgba(0,0,0,0.4);
+  }
+
+  .btn-lift {
+    transition: all 0.18s cubic-bezier(.22,.61,.36,1);
+  }
+  .btn-lift:hover {
+    transform: translateY(-1px);
+  }
+  .btn-lift:active {
+    transform: translateY(0);
+    transition-duration: 0.08s;
+  }
+
+  .hero-card {
+    position: relative;
+  }
+  .hero-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, rgba(201,168,107,0.35), transparent 40%, transparent 60%, rgba(201,168,107,0.15));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+    pointer-events: none;
+  }
+
+  .section-card {
+    position: relative;
+    transition: border-color 0.25s ease;
+  }
+  .section-card:hover { border-color: var(--line-2); }
+
+  .stat-value {
+    transition: color 0.35s ease;
+    will-change: color;
+  }
+
+  .reduced-motion-safe { animation: none !important; transition: none !important; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001s !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001s !important;
+    }
   }
 </style>
 </head>
@@ -234,18 +321,6 @@ const fmtTime = (h, short = false) => {
   return `${h12}:${String(mn).padStart(2, "0")} ${ap}${day}`;
 };
 
-const hoursToHHMM = h => {
-  let x = ((h % 24) + 24) % 24;
-  let mn = Math.round((x - Math.floor(x)) * 60);
-  let hr = Math.floor(x);
-  if (mn === 60) { hr += 1; mn = 0; }
-  return `${String(hr).padStart(2,"0")}:${String(mn).padStart(2,"0")}`;
-};
-const hhmmToHours = s => {
-  const [h, m] = s.split(":").map(Number);
-  return h + m/60;
-};
-
 const caffeineAt = (t, doses) => {
   let s = 0;
   for (const d of doses) {
@@ -257,11 +332,127 @@ const caffeineAt = (t, doses) => {
   return s;
 };
 
+const peakAverage = (doses, pS, pE, step = 0.1) => {
+  let sum = 0, n = 0;
+  for (let t = pS; t <= pE; t += step) { sum += caffeineAt(t, doses); n++; }
+  return n ? sum / n : 0;
+};
+
+/* Simulated-annealing optimizer.
+   Maximizes peak-window caffeine average subject to (soft) sleep + total constraints.
+   Preserves dose count; varies dose time (5-min steps) and mg (5mg steps). */
+const optimizeDoses = ({ nDoses, pS, pE, sT, respectSleep, capTotal, seedDoses }) => {
+  const N = Math.max(1, Math.min(8, nDoses | 0));
+  const TOTAL_CAP = capTotal ? DAILY_LIMIT : 800;
+  const tMin = Math.max(4, pS - 2);
+  const tMax = Math.max(pS + 0.5, sT - 0.25);
+  const mgMin = 10, mgMax = 300;
+  const clamp = (v, mn, mx) => Math.max(mn, Math.min(mx, v));
+  const snapT = t => Math.round(t * 12) / 12;
+  const snapM = m => Math.round(m / 5) * 5;
+
+  const score = (ds) => {
+    const peakAvg = peakAverage(ds, pS, pE, 0.1);
+    let penalty = 0;
+    if (respectSleep) {
+      const sleep = caffeineAt(sT, ds);
+      if (sleep > SLEEP_THRESHOLD) penalty += (sleep - SLEEP_THRESHOLD) ** 2 * 4;
+    }
+    const tot = ds.reduce((s, d) => s + d.mg, 0);
+    if (tot > TOTAL_CAP) penalty += (tot - TOTAL_CAP) ** 2 * 1.5;
+    return peakAvg - penalty;
+  };
+
+  const makeSeed = () => {
+    if (seedDoses && seedDoses.length === N) {
+      return seedDoses.map(d => ({
+        time: snapT(clamp(d.time, tMin, tMax)),
+        mg: snapM(clamp(d.mg, mgMin, mgMax)),
+      }));
+    }
+    if (N === 1) {
+      return [{ time: snapT(clamp(pS - 0.25, tMin, tMax)), mg: snapM(clamp(TOTAL_CAP, mgMin, mgMax)) }];
+    }
+    return Array.from({ length: N }, (_, i) => ({
+      time: snapT(clamp(tMin + (i / (N - 1)) * (tMax - tMin), tMin, tMax)),
+      mg: snapM(clamp(TOTAL_CAP / N, mgMin, mgMax)),
+    }));
+  };
+
+  let best = null, bestScore = -Infinity;
+  const restarts = 3;
+  for (let r = 0; r < restarts; r++) {
+    let current = makeSeed();
+    if (r > 0) {
+      current = current.map(d => ({
+        time: snapT(clamp(d.time + (Math.random() - 0.5) * 3, tMin, tMax)),
+        mg: snapM(clamp(d.mg + (Math.random() - 0.5) * 80, mgMin, mgMax)),
+      }));
+    }
+    current.sort((a, b) => a.time - b.time);
+    let curScore = score(current);
+    if (curScore > bestScore) { best = current.map(x => ({ ...x })); bestScore = curScore; }
+
+    const iters = 1200;
+    const T0 = 25;
+    for (let k = 0; k < iters; k++) {
+      const T = T0 * Math.pow(0.997, k);
+      const cand = current.map(d => ({ ...d }));
+      const idx = Math.floor(Math.random() * N);
+      const roll = Math.random();
+      if (roll < 0.45) {
+        const span = 1.5 * (T / T0) + 0.3;
+        cand[idx].time = snapT(clamp(cand[idx].time + (Math.random() - 0.5) * 2 * span, tMin, tMax));
+      } else if (roll < 0.9) {
+        const span = 60 * (T / T0) + 10;
+        cand[idx].mg = snapM(clamp(cand[idx].mg + (Math.random() - 0.5) * 2 * span, mgMin, mgMax));
+      } else {
+        cand[idx].time = snapT(tMin + Math.random() * (tMax - tMin));
+        cand[idx].mg = snapM(mgMin + Math.random() * (mgMax - mgMin));
+      }
+      cand.sort((a, b) => a.time - b.time);
+      const s = score(cand);
+      const dS = s - curScore;
+      if (dS > 0 || Math.random() < Math.exp(dS / Math.max(T, 0.01))) {
+        current = cand;
+        curScore = s;
+        if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+      }
+    }
+  }
+  return best.map(d => ({ time: d.time, mg: d.mg, type: "custom" }));
+};
+
+function useAnimatedNumber(target, duration = 500) {
+  const [val, setVal] = useState(target);
+  useEffect(() => {
+    const from = val;
+    if (from === target || !Number.isFinite(from) || !Number.isFinite(target)) {
+      setVal(target);
+      return;
+    }
+    let raf;
+    const start = performance.now();
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / duration);
+      const e = 1 - Math.pow(1 - t, 3);
+      setVal(from + (target - from) * e);
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  // eslint-disable-next-line
+  }, [target, duration]);
+  return val;
+}
+
 /* ---------- Chart ---------- */
 function Chart({ doses, pS, pE, sT, clearTime }) {
   const ref = useRef(null);
   const [hover, setHover] = useState(null);
   const [dims, setDims] = useState({ W: 0, H: 0 });
+  const progressRef = useRef(1);
+  const hoverRef = useRef(null);
 
   const draw = useCallback((hoverPt) => {
     const c = ref.current;
@@ -321,62 +512,86 @@ function Chart({ doses, pS, pE, sT, clearTime }) {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Dose markers
+    const progress = progressRef.current;
+    const progT = 6 + (eT - 6) * progress;
+
+    // Dose markers — fade in as curve reaches each dose
     doses.forEach(d => {
       const dx = xO(d.time);
-      ctx.strokeStyle = "rgba(201,168,107,0.25)";
+      const a = Math.max(0, Math.min(1, (progT - d.time) * 1.2));
+      if (a <= 0) return;
+      ctx.strokeStyle = `rgba(201,168,107,${0.25 * a})`;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(dx, p.t);
       ctx.lineTo(dx, p.t + cH);
       ctx.stroke();
-      // small droplet at top
-      ctx.fillStyle = "rgba(201,168,107,0.9)";
+      ctx.fillStyle = `rgba(201,168,107,${0.9 * a})`;
       ctx.beginPath();
       ctx.arc(dx, p.t - 4, 2.5, 0, Math.PI * 2);
       ctx.fill();
     });
 
+    const progIdx = Math.max(2, Math.ceil(pts.length * progress));
+    const visible = pts.slice(0, progIdx);
+
     // Curve fill — gradient
-    const grad = ctx.createLinearGradient(0, p.t, 0, p.t + cH);
-    grad.addColorStop(0, "rgba(201,168,107,0.28)");
-    grad.addColorStop(1, "rgba(201,168,107,0)");
-    ctx.beginPath();
-    ctx.moveTo(xO(pts[0].t), yO(0));
-    pts.forEach(q => ctx.lineTo(xO(q.t), yO(q.v)));
-    ctx.lineTo(xO(pts[pts.length - 1].t), yO(0));
-    ctx.closePath();
-    ctx.fillStyle = grad;
-    ctx.fill();
-
-    // Curve stroke
-    ctx.beginPath();
-    pts.forEach((q, i) => i === 0 ? ctx.moveTo(xO(q.t), yO(q.v)) : ctx.lineTo(xO(q.t), yO(q.v)));
-    ctx.strokeStyle = "#c9a86b";
-    ctx.lineWidth = 2;
-    ctx.shadowColor = "rgba(201,168,107,0.4)";
-    ctx.shadowBlur = 8;
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    // Safe-to-sleep marker
-    if (clearTime && clearTime <= eT) {
-      const cx = xO(clearTime);
-      const cy = yO(50);
-      ctx.setLineDash([2, 3]);
-      ctx.strokeStyle = "rgba(111,201,165,0.6)";
+    if (visible.length > 1) {
+      const grad = ctx.createLinearGradient(0, p.t, 0, p.t + cH);
+      grad.addColorStop(0, "rgba(201,168,107,0.28)");
+      grad.addColorStop(1, "rgba(201,168,107,0)");
       ctx.beginPath();
-      ctx.moveTo(cx, p.t);
-      ctx.lineTo(cx, p.t + cH);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
-      ctx.fillStyle = "#6fc9a5";
+      ctx.moveTo(xO(visible[0].t), yO(0));
+      visible.forEach(q => ctx.lineTo(xO(q.t), yO(q.v)));
+      ctx.lineTo(xO(visible[visible.length - 1].t), yO(0));
+      ctx.closePath();
+      ctx.fillStyle = grad;
       ctx.fill();
-      ctx.strokeStyle = "#0f0d14";
+
+      // Curve stroke
+      ctx.beginPath();
+      visible.forEach((q, i) => i === 0 ? ctx.moveTo(xO(q.t), yO(q.v)) : ctx.lineTo(xO(q.t), yO(q.v)));
+      ctx.strokeStyle = "#c9a86b";
       ctx.lineWidth = 2;
+      ctx.shadowColor = "rgba(201,168,107,0.45)";
+      ctx.shadowBlur = 10;
       ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // Leading dot — rides the tip of the curve during animation
+      if (progress < 1) {
+        const tip = visible[visible.length - 1];
+        ctx.beginPath();
+        ctx.arc(xO(tip.t), yO(tip.v), 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = "#e8d5a3";
+        ctx.shadowColor = "rgba(232,213,163,0.9)";
+        ctx.shadowBlur = 14;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    }
+
+    // Safe-to-sleep marker — fade in as curve reaches it
+    if (clearTime && clearTime <= eT) {
+      const a = Math.max(0, Math.min(1, (progT - clearTime) * 1.2));
+      if (a > 0) {
+        const cx = xO(clearTime);
+        const cy = yO(50);
+        ctx.setLineDash([2, 3]);
+        ctx.strokeStyle = `rgba(111,201,165,${0.6 * a})`;
+        ctx.beginPath();
+        ctx.moveTo(cx, p.t);
+        ctx.lineTo(cx, p.t + cH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(111,201,165,${a})`;
+        ctx.fill();
+        ctx.strokeStyle = "#0f0d14";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
     }
 
     // Axis labels
@@ -437,17 +652,36 @@ function Chart({ doses, pS, pE, sT, clearTime }) {
     }
   }, [doses, pS, pE, sT, clearTime]);
 
+  useEffect(() => { hoverRef.current = hover; }, [hover]);
+
+  // Curve draw-in animation on data/settings change
   useEffect(() => {
-    const id = setTimeout(() => draw(hover), 16);
-    return () => clearTimeout(id);
-  }, [draw, hover]);
+    progressRef.current = 0;
+    let raf;
+    const start = performance.now();
+    const dur = 420;
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / dur);
+      progressRef.current = 1 - Math.pow(1 - t, 3);
+      draw(hoverRef.current);
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [draw]);
+
+  // Hover-only redraw (progress stays where it is)
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => draw(hover));
+    return () => cancelAnimationFrame(raf);
+  }, [hover]);
 
   useEffect(() => {
     let id;
-    const h = () => { clearTimeout(id); id = setTimeout(() => draw(hover), 150); };
+    const h = () => { clearTimeout(id); id = setTimeout(() => draw(hoverRef.current), 150); };
     window.addEventListener("resize", h);
     return () => { window.removeEventListener("resize", h); clearTimeout(id); };
-  }, [draw, hover]);
+  }, [draw]);
 
   const onMove = (e) => {
     const c = ref.current;
@@ -519,11 +753,7 @@ function App() {
 
   /* derived values */
   const total = doses.reduce((s, d) => s + d.mg, 0);
-  const peakAvg = useMemo(() => {
-    let sum = 0, n = 0;
-    for (let t = pS; t <= pE; t += 0.25) { sum += caffeineAt(t, doses); n++; }
-    return n ? sum / n : 0;
-  }, [doses, pS, pE]);
+  const peakAvg = useMemo(() => peakAverage(doses, pS, pE, 0.25), [doses, pS, pE]);
   const sleepLevel = caffeineAt(sT, doses);
   const sleepOk = sleepLevel < SLEEP_THRESHOLD;
   const totalOk = total <= DAILY_LIMIT;
@@ -545,30 +775,35 @@ function App() {
   else if (sleepOk && peakAvg >= 40) { verdict = totalOk ? "Decent" : "Over daily limit"; verdictTone = "warn"; }
   else { verdict = !sleepOk ? "Sleep delayed" : "Low alertness"; verdictTone = "bad"; }
 
-  const tips = [];
-  if (!sleepOk && clearTime) tips.push({ tone: "bad", text: `Caffeine stays above ${SLEEP_THRESHOLD}mg until ${fmtTime(clearTime)}. Bedtime is compromised.` });
-  else if (clearTime) tips.push({ tone: "good", text: `You'll be safe to sleep by ${fmtTime(clearTime)}.` });
-  if (!totalOk) tips.push({ tone: "warn", text: `${total} mg total exceeds the 400 mg daily guideline.` });
-  if (peakAvg < 50 && doses.length > 0) tips.push({ tone: "warn", text: `Peak alertness average is only ${Math.round(peakAvg)} mg — consider an earlier dose.` });
+  const animTotal = useAnimatedNumber(total);
+  const animPeakAvg = useAnimatedNumber(peakAvg);
 
-  // daytime dip detection — only scan gaps between consecutive doses
-  if (doses.length >= 2) {
-    const sorted = [...doses].sort((a,b) => a.time - b.time);
-    for (let i = 0; i < sorted.length - 1; i++) {
-      const gapStart = sorted[i].time + 1;       // 1h after dose (past peak)
-      const gapEnd   = sorted[i+1].time - 0.25;  // stop before next dose starts absorbing
-      if (gapEnd - gapStart < 1) continue;       // too narrow, skip
-      let low = { v: 999, t: gapStart };
-      for (let t = gapStart; t <= gapEnd; t += 0.25) {
-        const v = caffeineAt(t, doses);
-        if (v < low.v) low = { t, v };
-      }
-      if (low.v < 30) {
-        tips.push({ tone: "warn", text: `Afternoon dip around ${fmtTime(low.t, true)} (~${Math.round(low.v)} mg).` });
-        break; // only report the worst/first dip
+  const tips = useMemo(() => {
+    const t = [];
+    if (!sleepOk && clearTime) t.push({ tone: "bad", text: `Caffeine stays above ${SLEEP_THRESHOLD}mg until ${fmtTime(clearTime)}. Bedtime is compromised.` });
+    else if (clearTime) t.push({ tone: "good", text: `You'll be safe to sleep by ${fmtTime(clearTime)}.` });
+    if (!totalOk) t.push({ tone: "warn", text: `${total} mg total exceeds the 400 mg daily guideline.` });
+    if (peakAvg < 50 && doses.length > 0) t.push({ tone: "warn", text: `Peak alertness average is only ${Math.round(peakAvg)} mg — consider an earlier dose.` });
+
+    if (doses.length >= 2) {
+      const sorted = [...doses].sort((a,b) => a.time - b.time);
+      for (let i = 0; i < sorted.length - 1; i++) {
+        const gapStart = sorted[i].time + 1;
+        const gapEnd   = sorted[i+1].time - 0.25;
+        if (gapEnd - gapStart < 1) continue;
+        let low = { v: 999, t: gapStart };
+        for (let tt = gapStart; tt <= gapEnd; tt += 0.25) {
+          const v = caffeineAt(tt, doses);
+          if (v < low.v) low = { t: tt, v };
+        }
+        if (low.v < 30) {
+          t.push({ tone: "warn", text: `Afternoon dip around ${fmtTime(low.t, true)} (~${Math.round(low.v)} mg).` });
+          break;
+        }
       }
     }
-  }
+    return t;
+  }, [doses, sleepOk, clearTime, totalOk, total, peakAvg]);
 
   const updateDose = (i, patch) => {
     const a = [...doses];
@@ -585,7 +820,48 @@ function App() {
     if (confirm("Reset all doses and settings?")) {
       setDoses([{ time: 8.5, mg: 95, type: "coffee" }]);
       setPS(9); setPE(17); setST(23);
+      setPrevDoses(null);
+      setLastOpt(null);
     }
+  };
+
+  /* Optimizer state */
+  const [respectSleep, setRespectSleep] = useState(true);
+  const [capTotal, setCapTotal] = useState(true);
+  const [targetDoseCount, setTargetDoseCount] = useState(doses.length);
+  const [prevDoses, setPrevDoses] = useState(null);
+  const [lastOpt, setLastOpt] = useState(null);
+  const [optimizing, setOptimizing] = useState(false);
+  const lastOptTimerRef = useRef(null);
+  useEffect(() => () => clearTimeout(lastOptTimerRef.current), []);
+
+  const runOptimize = () => {
+    setOptimizing(true);
+    const beforeAvg = peakAvg;
+    const beforeSleep = caffeineAt(sT, doses);
+    requestAnimationFrame(() => {
+      const next = optimizeDoses({
+        nDoses: targetDoseCount,
+        pS, pE, sT, respectSleep, capTotal,
+        seedDoses: targetDoseCount === doses.length ? doses : null,
+      });
+      setPrevDoses(doses);
+      setDoses(next);
+      const afterAvg = peakAverage(next, pS, pE, 0.25);
+      const afterSleep = caffeineAt(sT, next);
+      setLastOpt({ beforeAvg, afterAvg, beforeSleep, afterSleep });
+      clearTimeout(lastOptTimerRef.current);
+      lastOptTimerRef.current = setTimeout(() => setLastOpt(null), 6000);
+      setOptimizing(false);
+    });
+  };
+
+  const undoOptimize = () => {
+    if (!prevDoses) return;
+    setDoses(prevDoses);
+    setTargetDoseCount(prevDoses.length);
+    setPrevDoses(null);
+    setLastOpt(null);
   };
 
   return (
@@ -618,7 +894,7 @@ function App() {
         </header>
 
         {/* Hero verdict */}
-        <div className="fade-up" style={{
+        <div className="fade-up hero-card" style={{
           background: "linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%)",
           border: "1px solid var(--line-2)",
           borderRadius: "var(--r-lg)",
@@ -631,7 +907,8 @@ function App() {
           <div style={{
             position: "absolute", top: 0, right: 0, width: "240px", height: "240px",
             background: `radial-gradient(circle, ${toneGlow(verdictTone)} 0%, transparent 70%)`,
-            pointerEvents: "none"
+            pointerEvents: "none",
+            transition: "background 0.5s ease"
           }} />
           <div style={{
             display: "grid",
@@ -654,14 +931,14 @@ function App() {
             />
             <HeroStat
               label="Daily total"
-              value={`${total} mg`}
+              value={`${Math.round(animTotal)} mg`}
               sub={`of ${DAILY_LIMIT} mg`}
               tone={totalOk ? "neutral" : "warn"}
-              bar={{ value: Math.min(total, DAILY_LIMIT*1.5), max: DAILY_LIMIT }}
+              bar={{ value: Math.min(animTotal, DAILY_LIMIT*1.5), max: DAILY_LIMIT }}
             />
             <HeroStat
               label="Peak avg"
-              value={`${Math.round(peakAvg)} mg`}
+              value={`${Math.round(animPeakAvg)} mg`}
               sub={`${fmtTime(pS, true)}—${fmtTime(pE, true)}`}
               tone="neutral"
             />
@@ -688,9 +965,9 @@ function App() {
 
         {/* Tips */}
         {tips.length > 0 && (
-          <div className="fade-up" style={{ marginBottom: "20px", display: "flex", flexDirection: "column", gap: "8px", animationDelay: "0.15s" }}>
+          <div style={{ marginBottom: "20px", display: "flex", flexDirection: "column", gap: "8px" }}>
             {tips.map((t, i) => (
-              <div key={i} style={{
+              <div key={i} className="slide-in" style={{
                 display: "flex", gap: "12px", alignItems: "flex-start",
                 padding: "12px 16px",
                 background: toneBg(t.tone),
@@ -698,7 +975,8 @@ function App() {
                 borderRadius: "var(--r)",
                 fontSize: "14px",
                 lineHeight: 1.5,
-                color: "var(--ink)"
+                color: "var(--ink)",
+                animationDelay: `${0.15 + i * 0.06}s`
               }}>
                 <span style={{
                   width: "18px", height: "18px", flexShrink: 0, marginTop: "1px",
@@ -724,10 +1002,11 @@ function App() {
                 onChange={patch => updateDose(i, patch)}
                 onRemove={() => removeDose(i)}
                 isOnlyDose={doses.length === 1}
+                enterDelay={i * 0.04}
               />
             ))}
           </div>
-          <button onClick={addDose} style={{
+          <button onClick={addDose} className="btn-lift" style={{
             marginTop: "12px",
             width: "100%",
             padding: "12px",
@@ -737,14 +1016,156 @@ function App() {
             color: "var(--accent)",
             cursor: "pointer",
             fontSize: "14px",
-            fontWeight: 500,
-            transition: "all 0.15s ease"
+            fontWeight: 500
           }}
-          onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.background = "rgba(201,168,107,0.05)"; }}
-          onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line-2)"; e.currentTarget.style.background = "transparent"; }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.background = "rgba(201,168,107,0.06)"; e.currentTarget.style.boxShadow = "0 6px 20px -12px rgba(201,168,107,0.5)"; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line-2)"; e.currentTarget.style.background = "transparent"; e.currentTarget.style.boxShadow = "none"; }}
           >
             + Add dose
           </button>
+        </Section>
+
+        {/* Optimizer */}
+        <Section title="Optimizer" accent>
+          <p style={{
+            margin: "0 0 14px", fontSize: "13px", color: "var(--ink-dim)", lineHeight: 1.5,
+            fontFamily: "var(--serif)", fontStyle: "italic"
+          }}>
+            Rearranges dose times and amounts to maximize average caffeine during your peak window.
+          </p>
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+            gap: "12px",
+            marginBottom: "14px"
+          }}>
+            <OptimizerField label="Doses to plan">
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <button
+                  type="button"
+                  className="btn-lift"
+                  onClick={() => setTargetDoseCount(Math.max(1, targetDoseCount - 1))}
+                  disabled={targetDoseCount <= 1}
+                  style={stepperBtnStyle(targetDoseCount <= 1)}
+                  aria-label="Decrease dose count"
+                >−</button>
+                <div style={{
+                  flex: 1, textAlign: "center", fontFamily: "var(--mono)", fontWeight: 600,
+                  fontSize: "18px", color: "var(--accent)"
+                }}>{targetDoseCount}</div>
+                <button
+                  type="button"
+                  className="btn-lift"
+                  onClick={() => setTargetDoseCount(Math.min(6, targetDoseCount + 1))}
+                  disabled={targetDoseCount >= 6}
+                  style={stepperBtnStyle(targetDoseCount >= 6)}
+                  aria-label="Increase dose count"
+                >+</button>
+              </div>
+            </OptimizerField>
+            <OptimizerToggle
+              label="Respect bedtime"
+              hint={`Keep caffeine < ${SLEEP_THRESHOLD} mg at ${fmtTime(sT, true)}`}
+              checked={respectSleep}
+              onChange={setRespectSleep}
+            />
+            <OptimizerToggle
+              label="Daily cap"
+              hint={`Stay under ${DAILY_LIMIT} mg total`}
+              checked={capTotal}
+              onChange={setCapTotal}
+            />
+          </div>
+
+          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+            <button
+              onClick={runOptimize}
+              disabled={optimizing}
+              className="btn-lift"
+              style={{
+                flex: "1 1 200px",
+                padding: "14px 20px",
+                borderRadius: "var(--r)",
+                border: "1px solid rgba(201,168,107,0.5)",
+                background: "linear-gradient(135deg, rgba(201,168,107,0.18) 0%, rgba(232,213,163,0.10) 100%)",
+                color: "var(--accent-2)",
+                cursor: optimizing ? "wait" : "pointer",
+                fontSize: "14px",
+                fontWeight: 600,
+                letterSpacing: "0.03em",
+                display: "inline-flex", alignItems: "center", justifyContent: "center", gap: "10px",
+                opacity: optimizing ? 0.7 : 1,
+                boxShadow: "0 6px 24px -14px rgba(201,168,107,0.6)"
+              }}
+              onMouseEnter={e => {
+                if (optimizing) return;
+                e.currentTarget.style.borderColor = "var(--accent)";
+                e.currentTarget.style.background = "linear-gradient(135deg, rgba(201,168,107,0.28) 0%, rgba(232,213,163,0.16) 100%)";
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.borderColor = "rgba(201,168,107,0.5)";
+                e.currentTarget.style.background = "linear-gradient(135deg, rgba(201,168,107,0.18) 0%, rgba(232,213,163,0.10) 100%)";
+              }}
+            >
+              <span style={{ fontSize: "16px" }}>✦</span>
+              {optimizing ? "Optimizing…" : "Optimize peak window"}
+            </button>
+            {prevDoses && (
+              <button
+                onClick={undoOptimize}
+                className="btn-lift"
+                style={{
+                  padding: "14px 20px",
+                  borderRadius: "var(--r)",
+                  border: "1px solid var(--line-2)",
+                  background: "transparent",
+                  color: "var(--ink-dim)",
+                  cursor: "pointer",
+                  fontSize: "13px",
+                  fontFamily: "var(--mono)"
+                }}
+                onMouseEnter={e => { e.currentTarget.style.color = "var(--ink)"; e.currentTarget.style.borderColor = "var(--ink-dim)"; }}
+                onMouseLeave={e => { e.currentTarget.style.color = "var(--ink-dim)"; e.currentTarget.style.borderColor = "var(--line-2)"; }}
+              >
+                ↶ Undo
+              </button>
+            )}
+          </div>
+
+          {lastOpt && (
+            <div className="slide-in" style={{
+              marginTop: "14px",
+              padding: "12px 14px",
+              borderRadius: "var(--r)",
+              background: "rgba(111,201,165,0.06)",
+              border: "1px solid rgba(111,201,165,0.2)",
+              fontSize: "13px",
+              color: "var(--ink)",
+              display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap"
+            }}>
+              <span style={{ color: "var(--good)", fontWeight: 600 }}>✓ Optimized</span>
+              <span style={{ color: "var(--ink-dim)" }}>
+                Peak avg:{" "}
+                <span style={{ color: "var(--ink)", fontFamily: "var(--mono)" }}>
+                  {Math.round(lastOpt.beforeAvg)} → {Math.round(lastOpt.afterAvg)} mg
+                </span>
+                {lastOpt.afterAvg > lastOpt.beforeAvg && (
+                  <span style={{ color: "var(--good)", marginLeft: "6px", fontFamily: "var(--mono)" }}>
+                    +{Math.round(lastOpt.afterAvg - lastOpt.beforeAvg)}
+                  </span>
+                )}
+              </span>
+              <span style={{ color: "var(--ink-dim)" }}>
+                Bedtime:{" "}
+                <span style={{
+                  color: lastOpt.afterSleep < SLEEP_THRESHOLD ? "var(--good)" : "var(--bad)",
+                  fontFamily: "var(--mono)"
+                }}>
+                  {Math.round(lastOpt.afterSleep)} mg
+                </span>
+              </span>
+            </div>
+          )}
         </Section>
 
         {/* Schedule */}
@@ -770,7 +1191,7 @@ function App() {
             <span>Half-life: {HL}h · Model: exponential decay</span>
             <span>Made with {"<3"} by Atomic</span>
           </div>
-          <button onClick={resetAll} style={{
+          <button onClick={resetAll} className="btn-lift" style={{
             background: "transparent",
             border: "1px solid var(--line)",
             color: "var(--ink-dim)",
@@ -778,8 +1199,7 @@ function App() {
             borderRadius: "var(--r-sm)",
             fontSize: "12px",
             fontFamily: "var(--mono)",
-            cursor: "pointer",
-            transition: "all 0.15s ease"
+            cursor: "pointer"
           }}
           onMouseEnter={e => { e.currentTarget.style.color = "var(--bad)"; e.currentTarget.style.borderColor = "var(--bad)"; }}
           onMouseLeave={e => { e.currentTarget.style.color = "var(--ink-dim)"; e.currentTarget.style.borderColor = "var(--line)"; }}
@@ -812,7 +1232,7 @@ function HeroStat({ label, value, tone, big, mono, dot, sub, bar }) {
         )}
         {label}
       </div>
-      <div style={{
+      <div className="stat-value" style={{
         fontFamily: big ? "var(--serif)" : mono ? "var(--mono)" : "var(--sans)",
         fontWeight: big ? 500 : mono ? 500 : 600,
         fontSize: big ? "clamp(26px, 4.5vw, 36px)" : "clamp(20px, 3.5vw, 26px)",
@@ -837,7 +1257,7 @@ function HeroStat({ label, value, tone, big, mono, dot, sub, bar }) {
             height: "100%",
             background: bar.value > bar.max ? "var(--warn)" : "var(--accent)",
             borderRadius: "999px",
-            transition: "width 0.3s ease"
+            transition: "width 0.4s cubic-bezier(.22,.61,.36,1), background 0.3s ease"
           }} />
         </div>
       )}
@@ -845,11 +1265,13 @@ function HeroStat({ label, value, tone, big, mono, dot, sub, bar }) {
   );
 }
 
-function Section({ title, count, children }) {
+function Section({ title, count, children, accent }) {
   return (
-    <section className="fade-up" style={{
-      background: "var(--surface)",
-      border: "1px solid var(--line)",
+    <section className="fade-up section-card" style={{
+      background: accent
+        ? "linear-gradient(135deg, rgba(201,168,107,0.04) 0%, var(--surface) 60%)"
+        : "var(--surface)",
+      border: `1px solid ${accent ? "rgba(201,168,107,0.22)" : "var(--line)"}`,
       borderRadius: "var(--r-lg)",
       padding: "clamp(16px, 3vw, 24px)",
       marginBottom: "16px",
@@ -858,7 +1280,8 @@ function Section({ title, count, children }) {
       <div style={{ display: "flex", alignItems: "baseline", gap: "10px", marginBottom: "16px" }}>
         <h2 style={{
           fontFamily: "var(--serif)", fontWeight: 500, fontSize: "20px",
-          margin: 0, letterSpacing: "-0.01em"
+          margin: 0, letterSpacing: "-0.01em",
+          color: accent ? "var(--accent-2)" : "var(--ink)"
         }}>{title}</h2>
         {count != null && (
           <span style={{
@@ -874,21 +1297,103 @@ function Section({ title, count, children }) {
   );
 }
 
-function DoseRow({ index, dose, onChange, onRemove, isOnlyDose }) {
-  const timeStr = hoursToHHMM(dose.time);
+const stepperBtnStyle = (disabled) => ({
+  width: "34px", height: "34px", borderRadius: "8px",
+  border: "1px solid var(--line)", background: "var(--surface-2)",
+  color: disabled ? "var(--ink-soft)" : "var(--ink)",
+  cursor: disabled ? "not-allowed" : "pointer",
+  fontSize: "18px", fontWeight: 600,
+  display: "flex", alignItems: "center", justifyContent: "center",
+  opacity: disabled ? 0.4 : 1,
+  flexShrink: 0,
+  transition: "all 0.15s ease"
+});
+
+function OptimizerField({ label, children }) {
+  return (
+    <div style={{
+      background: "var(--surface-2)",
+      border: "1px solid var(--line)",
+      borderRadius: "var(--r)",
+      padding: "10px 12px",
+      display: "flex", flexDirection: "column", gap: "8px"
+    }}>
+      <div style={{
+        fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.15em",
+        color: "var(--ink-soft)", fontFamily: "var(--mono)", fontWeight: 500
+      }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function OptimizerToggle({ label, hint, checked, onChange }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!checked)}
+      style={{
+        background: checked ? "rgba(201,168,107,0.10)" : "var(--surface-2)",
+        border: `1px solid ${checked ? "rgba(201,168,107,0.4)" : "var(--line)"}`,
+        borderRadius: "var(--r)",
+        padding: "10px 12px",
+        display: "flex", flexDirection: "column", gap: "4px",
+        alignItems: "flex-start",
+        cursor: "pointer",
+        textAlign: "left",
+        transition: "all 0.15s ease",
+        color: "inherit"
+      }}
+      aria-pressed={checked}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: "8px", width: "100%" }}>
+        <span style={{
+          width: "34px", height: "20px", borderRadius: "999px",
+          background: checked ? "var(--accent)" : "rgba(255,255,255,0.1)",
+          position: "relative", flexShrink: 0,
+          transition: "background 0.2s ease"
+        }}>
+          <span style={{
+            position: "absolute", top: "2px",
+            left: checked ? "16px" : "2px",
+            width: "16px", height: "16px", borderRadius: "50%",
+            background: "var(--ink)",
+            transition: "left 0.2s cubic-bezier(.22,.61,.36,1)",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.4)"
+          }} />
+        </span>
+        <span style={{ fontSize: "13px", fontWeight: 500, color: "var(--ink)" }}>{label}</span>
+      </div>
+      {hint && <div style={{ fontSize: "11px", color: "var(--ink-soft)", marginLeft: "42px" }}>{hint}</div>}
+    </button>
+  );
+}
+
+function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }) {
   const [draftMg, setDraftMg] = useState(dose.mg);
+  const [draftTime, setDraftTime] = useState(dose.time);
   useEffect(() => { setDraftMg(dose.mg); }, [dose.mg]);
+  useEffect(() => { setDraftTime(dose.time); }, [dose.time]);
   const mgTimerRef = useRef(null);
-  useEffect(() => () => clearTimeout(mgTimerRef.current), []);
+  const timeTimerRef = useRef(null);
+  useEffect(() => () => { clearTimeout(mgTimerRef.current); clearTimeout(timeTimerRef.current); }, []);
   const handleMgChange = e => {
     const v = parseInt(e.target.value);
     setDraftMg(v);
     clearTimeout(mgTimerRef.current);
     mgTimerRef.current = setTimeout(() => onChange({ mg: v, type: "custom" }), 120);
   };
+  const handleTimeChange = e => {
+    const v = parseFloat(e.target.value);
+    setDraftTime(v);
+    clearTimeout(timeTimerRef.current);
+    timeTimerRef.current = setTimeout(() => onChange({ time: v }), 120);
+  };
+  const T_MIN = 4, T_MAX = 24;
+  const timePct = ((draftTime - T_MIN) / (T_MAX - T_MIN)) * 100;
 
   return (
-    <div style={{
+    <div className="dose-card slide-in" style={{
       background: "var(--surface-2)",
       border: "1px solid var(--line)",
       borderRadius: "var(--r)",
@@ -896,7 +1401,7 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose }) {
       display: "flex",
       flexDirection: "column",
       gap: "12px",
-      transition: "border-color 0.15s ease"
+      animationDelay: `${enterDelay}s`
     }}>
       {/* Top row: badge + select + remove */}
       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -954,23 +1459,26 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose }) {
         </button>
       </div>
 
-      {/* Bottom row: time + amount side by side */}
-      <div style={{
-        display: "grid",
-        gridTemplateColumns: "minmax(130px, 1fr) minmax(0, 1.3fr)",
-        gap: "12px",
-        alignItems: "end"
-      }}>
+      {/* Bottom: two stacked sliders */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
           <label style={{
             fontSize: "10px", color: "var(--ink-soft)", textTransform: "uppercase",
-            letterSpacing: "0.15em", fontFamily: "var(--mono)", fontWeight: 500
-          }}>Time</label>
+            letterSpacing: "0.15em", fontFamily: "var(--mono)", fontWeight: 500,
+            display: "flex", justifyContent: "space-between", alignItems: "baseline"
+          }}>
+            <span>Time</span>
+            <span style={{
+              color: "var(--accent)", fontWeight: 600, fontSize: "13px",
+              letterSpacing: "normal", textTransform: "none"
+            }}>{fmtTime(draftTime, true)}</span>
+          </label>
           <input
-            type="time"
-            value={timeStr}
-            onChange={e => onChange({ time: hhmmToHours(e.target.value) })}
-            style={{ width: "100%" }}
+            type="range"
+            min={T_MIN} max={T_MAX} step={5/60}
+            value={draftTime}
+            onChange={handleTimeChange}
+            style={{ "--pct": `${timePct}%` }}
             aria-label={`Time for dose ${index + 1}`}
           />
         </div>
