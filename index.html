@@ -338,12 +338,88 @@ const peakAverage = (doses, pS, pE, step = 0.1) => {
   return n ? sum / n : 0;
 };
 
-/* Simulated-annealing optimizer.
-   Maximizes peak-window caffeine average subject to (soft) sleep + total constraints.
-   Preserves dose count; varies dose time (5-min steps) and mg (5mg steps). */
-const optimizeDoses = ({ nDoses, pS, pE, sT, respectSleep, capTotal, seedDoses }) => {
-  const N = Math.max(1, Math.min(8, nDoses | 0));
-  const TOTAL_CAP = capTotal ? DAILY_LIMIT : 800;
+/* Single-dose contribution to peak-window average per 1 mg.
+   Analytical = ∫ min(1, (t-t_d)/0.75) * 0.5^((t-t_d)/HL) dt over [pS, pE], divided by (pE - pS). */
+const peakCoefAt = (doseTime, pS, pE) => {
+  if (doseTime >= pE) return 0;
+  let sum = 0, n = 0;
+  for (let t = pS; t <= pE; t += 0.1) {
+    if (t >= doseTime) {
+      const el = t - doseTime;
+      sum += Math.min(1, el / 0.75) * Math.pow(0.5, el / HL);
+    }
+    n++;
+  }
+  return n ? sum / n : 0;
+};
+/* Residue at sleep time per 1 mg for a dose placed at doseTime. */
+const sleepCoefAt = (doseTime, sT) => {
+  if (doseTime > sT) return 0;
+  const el = sT - doseTime;
+  return Math.min(1, el / 0.75) * Math.pow(0.5, el / HL);
+};
+
+/* Greedy water-filling mg allocator for a fixed set of dose times.
+   Objective: maximize Σ c_i m_i subject to Σ m_i ≤ totalBudget,
+   Σ s_i m_i ≤ sleepBudget, mgMin ≤ m_i ≤ mgMax.
+   Handles contribution from locked doses as pre-consumed budget.
+   Returns mg[] of same length as times. */
+const allocateMg = (times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep) => {
+  const N = times.length;
+  if (N === 0) return [];
+  const c = times.map(t => peakCoefAt(t, pS, pE));
+  const s = times.map(t => sleepCoefAt(t, sT));
+
+  // Start at minimum allocation
+  const mg = new Array(N).fill(mgMin);
+  let totalUsed = mgMin * N;
+  let sleepUsed = mg.reduce((a, v, i) => a + v * s[i], 0);
+
+  // If even the minimum violates, there's nothing we can do — return minimums
+  if (totalUsed > totalBudget) return mg;
+
+  // Rank doses: a dose that gives a lot of peak per sleep-cost wins first if sleep is binding
+  // Otherwise, just by peak coefficient
+  const order = Array.from({ length: N }, (_, i) => i);
+  const rank = i => {
+    if (!respectSleep) return c[i];
+    if (s[i] <= 1e-6) return c[i] * 1e6; // essentially free for sleep
+    return c[i] / Math.max(s[i], 0.01);
+  };
+  order.sort((a, b) => rank(b) - rank(a));
+
+  // Distribute budget to top-ranked doses
+  for (const i of order) {
+    const maxAddByTotal = totalBudget - totalUsed;
+    const maxAddBySleep = respectSleep
+      ? (s[i] > 1e-6 ? Math.max(0, (sleepBudget - sleepUsed) / s[i]) : Infinity)
+      : Infinity;
+    const maxAddByBox = mgMax - mg[i];
+    const add = Math.max(0, Math.min(maxAddByTotal, maxAddBySleep, maxAddByBox));
+    mg[i] += add;
+    totalUsed += add;
+    sleepUsed += add * s[i];
+    if (totalUsed >= totalBudget - 1e-6) break;
+  }
+
+  return mg;
+};
+
+/* Main optimizer.
+   - `lockedDoses` are fixed and contribute to peak + sleep + total budgets.
+   - Produces `nNew` optimized doses (times + mg).
+   - Uses smart init (multi-start on dose-time configurations with analytical mg allocator),
+     then simulated annealing to fine-tune. */
+const optimizeDoses = ({
+  nNew, pS, pE, sT, respectSleep, capTotal, seedDoses, lockedDoses
+}) => {
+  const N = Math.max(1, Math.min(8, nNew | 0));
+  const locked = lockedDoses || [];
+  const TOTAL_CAP_RAW = capTotal ? DAILY_LIMIT : 800;
+  const lockedTotal = locked.reduce((a, d) => a + d.mg, 0);
+  const lockedSleep = locked.reduce((a, d) => a + d.mg * sleepCoefAt(d.time, sT), 0);
+  const totalBudget = Math.max(0, TOTAL_CAP_RAW - lockedTotal);
+  const sleepBudget = Math.max(0, SLEEP_THRESHOLD - lockedSleep);
   const tMin = Math.max(4, pS - 2);
   const tMax = Math.max(pS + 0.5, sT - 0.25);
   const mgMin = 10, mgMax = 300;
@@ -351,76 +427,118 @@ const optimizeDoses = ({ nDoses, pS, pE, sT, respectSleep, capTotal, seedDoses }
   const snapT = t => Math.round(t * 12) / 12;
   const snapM = m => Math.round(m / 5) * 5;
 
-  const score = (ds) => {
-    const peakAvg = peakAverage(ds, pS, pE, 0.1);
+  // Scoring evaluates locked + candidate combined curve over peak window
+  const peakAvgWithLocked = (cand) => {
+    const all = locked.concat(cand);
+    return peakAverage(all, pS, pE, 0.1);
+  };
+  const score = (cand) => {
+    const all = locked.concat(cand);
+    const peakAvg = peakAverage(all, pS, pE, 0.1);
     let penalty = 0;
     if (respectSleep) {
-      const sleep = caffeineAt(sT, ds);
+      const sleep = caffeineAt(sT, all);
       if (sleep > SLEEP_THRESHOLD) penalty += (sleep - SLEEP_THRESHOLD) ** 2 * 4;
     }
-    const tot = ds.reduce((s, d) => s + d.mg, 0);
-    if (tot > TOTAL_CAP) penalty += (tot - TOTAL_CAP) ** 2 * 1.5;
+    const tot = all.reduce((a, d) => a + d.mg, 0);
+    if (capTotal && tot > DAILY_LIMIT) penalty += (tot - DAILY_LIMIT) ** 2 * 1.5;
     return peakAvg - penalty;
   };
 
-  const makeSeed = () => {
-    if (seedDoses && seedDoses.length === N) {
-      return seedDoses.map(d => ({
-        time: snapT(clamp(d.time, tMin, tMax)),
-        mg: snapM(clamp(d.mg, mgMin, mgMax)),
-      }));
-    }
-    if (N === 1) {
-      return [{ time: snapT(clamp(pS - 0.25, tMin, tMax)), mg: snapM(clamp(TOTAL_CAP, mgMin, mgMax)) }];
-    }
-    return Array.from({ length: N }, (_, i) => ({
-      time: snapT(clamp(tMin + (i / (N - 1)) * (tMax - tMin), tMin, tMax)),
-      mg: snapM(clamp(TOTAL_CAP / N, mgMin, mgMax)),
-    }));
+  // Build a candidate from a given set of times using the analytical mg allocator
+  const buildFromTimes = (times) => {
+    const mgs = allocateMg(times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep);
+    return times.map((t, i) => ({ time: snapT(t), mg: snapM(mgs[i]) }));
   };
 
-  let best = null, bestScore = -Infinity;
-  const restarts = 3;
-  for (let r = 0; r < restarts; r++) {
-    let current = makeSeed();
-    if (r > 0) {
-      current = current.map(d => ({
-        time: snapT(clamp(d.time + (Math.random() - 0.5) * 3, tMin, tMax)),
-        mg: snapM(clamp(d.mg + (Math.random() - 0.5) * 80, mgMin, mgMax)),
-      }));
-    }
-    current.sort((a, b) => a.time - b.time);
-    let curScore = score(current);
-    if (curScore > bestScore) { best = current.map(x => ({ ...x })); bestScore = curScore; }
+  // --- Smart initialization: grid-search over dose-time configurations ---
+  // Time grid at 30-min resolution over [max(tMin, pS - 1), min(tMax, pE + 0.5)] focused around peak,
+  // plus a few earlier slots if peak starts late.
+  const gridLo = Math.max(tMin, pS - 1.5);
+  const gridHi = Math.min(tMax, pE + 0.25);
+  const gridStep = 0.5;
+  const slots = [];
+  for (let t = gridLo; t <= gridHi + 1e-9; t += gridStep) slots.push(t);
+  // Include tMin and tMax as extra options so edges aren't missed
+  if (slots[0] > tMin) slots.unshift(tMin);
+  if (slots[slots.length - 1] < tMax) slots.push(tMax);
 
-    const iters = 1200;
-    const T0 = 25;
-    for (let k = 0; k < iters; k++) {
-      const T = T0 * Math.pow(0.997, k);
-      const cand = current.map(d => ({ ...d }));
-      const idx = Math.floor(Math.random() * N);
-      const roll = Math.random();
-      if (roll < 0.45) {
-        const span = 1.5 * (T / T0) + 0.3;
-        cand[idx].time = snapT(clamp(cand[idx].time + (Math.random() - 0.5) * 2 * span, tMin, tMax));
-      } else if (roll < 0.9) {
-        const span = 60 * (T / T0) + 10;
-        cand[idx].mg = snapM(clamp(cand[idx].mg + (Math.random() - 0.5) * 2 * span, mgMin, mgMax));
-      } else {
-        cand[idx].time = snapT(tMin + Math.random() * (tMax - tMin));
-        cand[idx].mg = snapM(mgMin + Math.random() * (mgMax - mgMin));
+  // Enumerate ordered combinations (with repetition disallowed) — cap total combos to ~4000
+  let combos = [];
+  const MAX_COMBOS = 4000;
+  const rec = (start, acc) => {
+    if (combos.length >= MAX_COMBOS) return;
+    if (acc.length === N) { combos.push(acc.slice()); return; }
+    for (let i = start; i < slots.length; i++) {
+      if (combos.length >= MAX_COMBOS) return;
+      acc.push(slots[i]);
+      rec(i + 1, acc);
+      acc.pop();
+    }
+  };
+  if (N <= 4) {
+    rec(0, []);
+  } else {
+    // Random sampling for larger N
+    for (let k = 0; k < MAX_COMBOS; k++) {
+      const picked = [];
+      const used = new Set();
+      while (picked.length < N) {
+        const j = Math.floor(Math.random() * slots.length);
+        if (!used.has(j)) { used.add(j); picked.push(slots[j]); }
       }
-      cand.sort((a, b) => a.time - b.time);
-      const s = score(cand);
-      const dS = s - curScore;
-      if (dS > 0 || Math.random() < Math.exp(dS / Math.max(T, 0.01))) {
-        current = cand;
-        curScore = s;
-        if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
-      }
+      picked.sort((a, b) => a - b);
+      combos.push(picked);
     }
   }
-  return best.map(d => ({ time: d.time, mg: d.mg, type: "custom" }));
+
+  let best = null, bestScore = -Infinity;
+  for (const times of combos) {
+    const cand = buildFromTimes(times);
+    const s = score(cand);
+    if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+  }
+
+  // Seed-dose: if the user already has N unlocked doses, include that config in evaluation
+  if (seedDoses && seedDoses.length === N) {
+    const seedTimes = seedDoses.map(d => snapT(clamp(d.time, tMin, tMax))).sort((a, b) => a - b);
+    const cand = buildFromTimes(seedTimes);
+    const s = score(cand);
+    if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+  }
+
+  // --- Local refinement: simulated annealing around the best config ---
+  let current = best.map(x => ({ ...x }));
+  let curScore = bestScore;
+  const iters = 1500;
+  const T0 = 15;
+  for (let k = 0; k < iters; k++) {
+    const T = T0 * Math.pow(0.9975, k);
+    const cand = current.map(d => ({ ...d }));
+    const idx = Math.floor(Math.random() * N);
+    const roll = Math.random();
+    if (roll < 0.55) {
+      // Perturb time; reallocate mg analytically for new times
+      const span = 1.2 * (T / T0) + 0.15;
+      cand[idx].time = snapT(clamp(cand[idx].time + (Math.random() - 0.5) * 2 * span, tMin, tMax));
+      cand.sort((a, b) => a.time - b.time);
+      const mgs = allocateMg(cand.map(d => d.time), pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep);
+      cand.forEach((d, i) => { d.mg = snapM(mgs[i]); });
+    } else {
+      // Perturb mg directly
+      const span = 50 * (T / T0) + 8;
+      cand[idx].mg = snapM(clamp(cand[idx].mg + (Math.random() - 0.5) * 2 * span, mgMin, mgMax));
+    }
+    const s = score(cand);
+    const dS = s - curScore;
+    if (dS > 0 || Math.random() < Math.exp(dS / Math.max(T, 0.01))) {
+      current = cand;
+      curScore = s;
+      if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+    }
+  }
+
+  return best.map(d => ({ time: d.time, mg: d.mg, type: "custom", locked: false }));
 };
 
 function useAnimatedNumber(target, duration = 500) {
@@ -735,8 +853,8 @@ function App() {
       }
     } catch(e) {}
     return [
-      { time: 8.5,  mg: 95, type: "coffee" },
-      { time: 14,   mg: 64, type: "espresso" },
+      { time: 8.5,  mg: 95, type: "coffee",   locked: false },
+      { time: 14,   mg: 64, type: "espresso", locked: false },
     ];
   });
   const [pS, setPS] = useState(() => +localStorage.getItem(STORAGE_KEYS.peakStart) || 9);
@@ -813,12 +931,12 @@ function App() {
   const removeDose = i => setDoses(doses.filter((_, j) => j !== i));
   const addDose = () => {
     const lt = doses.length ? doses[doses.length - 1].time + 2 : 10;
-    setDoses([...doses, { time: Math.min(lt, 23), mg: 95, type: "coffee" }]);
+    setDoses([...doses, { time: Math.min(lt, 23), mg: 95, type: "coffee", locked: false }]);
   };
 
   const resetAll = () => {
     if (confirm("Reset all doses and settings?")) {
-      setDoses([{ time: 8.5, mg: 95, type: "coffee" }]);
+      setDoses([{ time: 8.5, mg: 95, type: "coffee", locked: false }]);
       setPS(9); setPE(17); setST(23);
       setPrevDoses(null);
       setLastOpt(null);
@@ -826,9 +944,11 @@ function App() {
   };
 
   /* Optimizer state */
+  const unlockedCount = doses.filter(d => !d.locked).length;
+  const lockedCount = doses.length - unlockedCount;
   const [respectSleep, setRespectSleep] = useState(true);
   const [capTotal, setCapTotal] = useState(true);
-  const [targetDoseCount, setTargetDoseCount] = useState(doses.length);
+  const [targetDoseCount, setTargetDoseCount] = useState(Math.max(1, unlockedCount));
   const [prevDoses, setPrevDoses] = useState(null);
   const [lastOpt, setLastOpt] = useState(null);
   const [optimizing, setOptimizing] = useState(false);
@@ -839,16 +959,20 @@ function App() {
     setOptimizing(true);
     const beforeAvg = peakAvg;
     const beforeSleep = caffeineAt(sT, doses);
+    const lockedDoses = doses.filter(d => d.locked);
+    const unlockedDoses = doses.filter(d => !d.locked);
     requestAnimationFrame(() => {
-      const next = optimizeDoses({
-        nDoses: targetDoseCount,
+      const optimized = optimizeDoses({
+        nNew: targetDoseCount,
         pS, pE, sT, respectSleep, capTotal,
-        seedDoses: targetDoseCount === doses.length ? doses : null,
+        seedDoses: targetDoseCount === unlockedDoses.length ? unlockedDoses : null,
+        lockedDoses,
       });
+      const merged = [...lockedDoses, ...optimized].sort((a, b) => a.time - b.time);
       setPrevDoses(doses);
-      setDoses(next);
-      const afterAvg = peakAverage(next, pS, pE, 0.25);
-      const afterSleep = caffeineAt(sT, next);
+      setDoses(merged);
+      const afterAvg = peakAverage(merged, pS, pE, 0.25);
+      const afterSleep = caffeineAt(sT, merged);
       setLastOpt({ beforeAvg, afterAvg, beforeSleep, afterSleep });
       clearTimeout(lastOptTimerRef.current);
       lastOptTimerRef.current = setTimeout(() => setLastOpt(null), 6000);
@@ -859,7 +983,7 @@ function App() {
   const undoOptimize = () => {
     if (!prevDoses) return;
     setDoses(prevDoses);
-    setTargetDoseCount(prevDoses.length);
+    setTargetDoseCount(Math.max(1, prevDoses.filter(d => !d.locked).length));
     setPrevDoses(null);
     setLastOpt(null);
   };
@@ -1032,6 +1156,7 @@ function App() {
             fontFamily: "var(--serif)", fontStyle: "italic"
           }}>
             Rearranges dose times and amounts to maximize average caffeine during your peak window.
+            {lockedCount > 0 && <> <span style={{ color: "var(--accent-2)", fontStyle: "normal", fontFamily: "var(--sans)", fontSize: "12px", fontWeight: 500 }}>{lockedCount} locked dose{lockedCount === 1 ? "" : "s"} will stay put.</span></>}
           </p>
           <div style={{
             display: "grid",
@@ -1039,7 +1164,7 @@ function App() {
             gap: "12px",
             marginBottom: "14px"
           }}>
-            <OptimizerField label="Doses to plan">
+            <OptimizerField label={lockedCount > 0 ? "New doses to plan" : "Doses to plan"}>
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <button
                   type="button"
@@ -1377,13 +1502,16 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
   const mgTimerRef = useRef(null);
   const timeTimerRef = useRef(null);
   useEffect(() => () => { clearTimeout(mgTimerRef.current); clearTimeout(timeTimerRef.current); }, []);
+  const locked = !!dose.locked;
   const handleMgChange = e => {
+    if (locked) return;
     const v = parseInt(e.target.value);
     setDraftMg(v);
     clearTimeout(mgTimerRef.current);
     mgTimerRef.current = setTimeout(() => onChange({ mg: v, type: "custom" }), 120);
   };
   const handleTimeChange = e => {
+    if (locked) return;
     const v = parseFloat(e.target.value);
     setDraftTime(v);
     clearTimeout(timeTimerRef.current);
@@ -1391,17 +1519,19 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
   };
   const T_MIN = 4, T_MAX = 24;
   const timePct = ((draftTime - T_MIN) / (T_MAX - T_MIN)) * 100;
+  const toggleLock = () => onChange({ locked: !locked });
 
   return (
     <div className="dose-card slide-in" style={{
-      background: "var(--surface-2)",
-      border: "1px solid var(--line)",
+      background: locked ? "rgba(201,168,107,0.05)" : "var(--surface-2)",
+      border: `1px solid ${locked ? "rgba(201,168,107,0.3)" : "var(--line)"}`,
       borderRadius: "var(--r)",
       padding: "14px 16px",
       display: "flex",
       flexDirection: "column",
       gap: "12px",
-      animationDelay: `${enterDelay}s`
+      animationDelay: `${enterDelay}s`,
+      opacity: 1
     }}>
       {/* Top row: badge + select + remove */}
       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -1417,17 +1547,49 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
         <select
           value={dose.type}
           onChange={e => {
+            if (locked) return;
             const t = e.target.value;
             const base = DRINKS[t];
             onChange({ type: t, mg: t === "custom" ? dose.mg : base.mg });
           }}
-          style={{ flex: 1, minWidth: 0 }}
+          disabled={locked}
+          style={{ flex: 1, minWidth: 0, opacity: locked ? 0.55 : 1, cursor: locked ? "not-allowed" : "pointer" }}
           aria-label={`Drink type for dose ${index + 1}`}
         >
           {Object.entries(DRINKS).map(([k, v]) => (
             <option key={k} value={k}>{v.icon}  {v.label}</option>
           ))}
         </select>
+
+        <button
+          onClick={toggleLock}
+          title={locked ? "Unlock — allow optimizer to modify" : "Lock — pin this dose (e.g., already consumed)"}
+          style={{
+            width: "32px", height: "32px", borderRadius: "8px",
+            border: `1px solid ${locked ? "rgba(201,168,107,0.5)" : "var(--line)"}`,
+            background: locked ? "rgba(201,168,107,0.12)" : "transparent",
+            color: locked ? "var(--accent-2)" : "var(--ink-soft)",
+            cursor: "pointer",
+            fontSize: "13px",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "all 0.15s ease",
+            flexShrink: 0
+          }}
+          onMouseEnter={e => {
+            if (locked) return;
+            e.currentTarget.style.color = "var(--accent-2)";
+            e.currentTarget.style.borderColor = "rgba(201,168,107,0.4)";
+          }}
+          onMouseLeave={e => {
+            if (locked) return;
+            e.currentTarget.style.color = "var(--ink-soft)";
+            e.currentTarget.style.borderColor = "var(--line)";
+          }}
+          aria-label={locked ? "Unlock dose" : "Lock dose"}
+          aria-pressed={locked}
+        >
+          {locked ? "🔒" : "🔓"}
+        </button>
 
         <button
           onClick={isOnlyDose ? undefined : onRemove}
@@ -1460,7 +1622,7 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
       </div>
 
       {/* Bottom: two stacked sliders */}
-      <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: "10px", opacity: locked ? 0.7 : 1 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
           <label style={{
             fontSize: "10px", color: "var(--ink-soft)", textTransform: "uppercase",
@@ -1478,7 +1640,8 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
             min={T_MIN} max={T_MAX} step={5/60}
             value={draftTime}
             onChange={handleTimeChange}
-            style={{ "--pct": `${timePct}%` }}
+            disabled={locked}
+            style={{ "--pct": `${timePct}%`, cursor: locked ? "not-allowed" : "pointer" }}
             aria-label={`Time for dose ${index + 1}`}
           />
         </div>
@@ -1499,7 +1662,8 @@ function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0 }
             min={10} max={400} step={5}
             value={draftMg}
             onChange={handleMgChange}
-            style={{ "--pct": `${((draftMg - 10) / 390) * 100}%` }}
+            disabled={locked}
+            style={{ "--pct": `${((draftMg - 10) / 390) * 100}%`, cursor: locked ? "not-allowed" : "pointer" }}
             aria-label={`Amount in mg for dose ${index + 1}`}
           />
         </div>
