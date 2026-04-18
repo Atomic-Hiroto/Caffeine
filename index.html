@@ -1005,7 +1005,7 @@ function App() {
         lockedDoses: effectiveLocked,
         earliestTime: earliestNew,
       });
-      const merged = [...lockedDoses, ...optimized].sort((a, b) => a.time - b.time);
+      const merged = [...effectiveLocked, ...optimized].sort((a, b) => a.time - b.time);
       setPrevDoses(doses);
       setDoses(merged);
       const afterAvg = peakAverage(merged, pS, pE, 0.25);
