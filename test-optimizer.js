@@ -165,6 +165,7 @@ const buildContext = (sc) => {
   const locked = sc.locked || [];
   const capTotal = sc.capTotal ?? true;
   const respectSleep = sc.respectSleep ?? true;
+  const blocks = (sc.blockedWindows || []).filter(w => w && w.end > w.start + 1e-6);
   const TOTAL_CAP_RAW = capTotal ? DAILY_LIMIT : 800;
   const lockedTotal = locked.reduce((a, d) => a + d.mg, 0);
   const lockedSleepLevel = locked.length ? caffeineAt(sc.sT, locked) : 0;
@@ -172,10 +173,32 @@ const buildContext = (sc) => {
   const sleepBudget = Math.max(0, SLEEP_THRESHOLD - lockedSleepLevel);
   const tMin = Math.max(4, sc.pS - 2, sc.earliestTime ?? 0);
   const tMax = Math.min(sc.pE, sc.sT - 0.5);
+  const isBlocked = (t) => blocks.some(w => t >= w.start - 1e-9 && t < w.end - 1e-9);
   return {
     ...sc, locked, respectSleep, capTotal, lockedSleepLevel, totalBudget, sleepBudget,
-    tMin, tMax, mgMin: 10, mgMax: 300,
+    tMin, tMax, mgMin: 10, mgMax: 300, blocks, isBlocked,
   };
+};
+
+/* Snap mg to 5mg; if rounding pushed sleep past threshold, trim the largest-sleep-coef dose */
+const snapMgRespectSleep = (cand, sT, lockedSleepLevel, respectSleep) => {
+  const snapped = cand.map(d => ({ ...d, mg: Math.round(d.mg / 5) * 5 }));
+  if (!respectSleep) return snapped;
+  const sCoefs = snapped.map(d => sleepCoefAt(d.time, sT));
+  const remaining = Math.max(0, SLEEP_THRESHOLD - lockedSleepLevel);
+  let sleepUsed = snapped.reduce((a, d, i) => a + sCoefs[i] * d.mg, 0);
+  let guard = 0;
+  while (sleepUsed > remaining + 1e-6 && guard++ < 200) {
+    let pick = -1, pickS = -Infinity;
+    for (let i = 0; i < snapped.length; i++) {
+      if (snapped[i].mg <= 10) continue;
+      if (sCoefs[i] > pickS) { pickS = sCoefs[i]; pick = i; }
+    }
+    if (pick < 0) break;
+    snapped[pick].mg -= 5;
+    sleepUsed -= 5 * sCoefs[pick];
+  }
+  return snapped;
 };
 
 const scoreCandidate = (ctx, cand) => {
@@ -196,7 +219,7 @@ const scoreCandidate = (ctx, cand) => {
 /* ---------- OLD optimizer: 30-min grid + greedy + SA ---------- */
 function optimizer_OLD(sc) {
   const ctx = buildContext(sc);
-  const { nNew, pS, pE, sT, respectSleep, locked, tMin, tMax, mgMin, mgMax, totalBudget, sleepBudget } = ctx;
+  const { nNew, pS, pE, sT, respectSleep, locked, tMin, tMax, mgMin, mgMax, totalBudget, sleepBudget, isBlocked } = ctx;
   const N = Math.max(1, Math.min(8, nNew | 0));
   if (tMin >= tMax - 0.1) {
     return Array.from({ length: N }, (_, i) => ({
@@ -210,9 +233,14 @@ function optimizer_OLD(sc) {
   const gridLo = Math.max(tMin, pS - 1.5);
   const gridHi = Math.min(tMax, pE + 0.25);
   const slots = [];
-  for (let t = gridLo; t <= gridHi + 1e-9; t += 0.5) slots.push(t);
-  if (slots[0] > tMin) slots.unshift(tMin);
-  if (slots[slots.length - 1] < tMax) slots.push(tMax);
+  for (let t = gridLo; t <= gridHi + 1e-9; t += 0.5) {
+    if (!isBlocked(t)) slots.push(t);
+  }
+  if (!isBlocked(tMin) && (slots.length === 0 || slots[0] > tMin)) slots.unshift(tMin);
+  if (slots.length && !isBlocked(tMax) && slots[slots.length - 1] < tMax) slots.push(tMax);
+  if (slots.length === 0) return Array.from({ length: N }, (_, i) => ({
+    time: snapT(clamp(tMin + i * 0.25, tMin, tMax)), mg: mgMin, type: "custom", locked: false,
+  }));
   let best = null, bestScore = -Infinity;
   const combos = [];
   const MAX_COMBOS = 4000;
@@ -250,7 +278,9 @@ function optimizer_OLD(sc) {
     const roll = Math.random();
     if (roll < 0.55) {
       const span = 1.2 * (T / T0) + 0.15;
-      cand[idx].time = snapT(clamp(cand[idx].time + (Math.random() - 0.5) * 2 * span, tMin, tMax));
+      let newT = snapT(clamp(cand[idx].time + (Math.random() - 0.5) * 2 * span, tMin, tMax));
+      if (isBlocked(newT)) continue; // skip this SA step if it lands in a blocked window
+      cand[idx].time = newT;
       cand.sort((a, b) => a.time - b.time);
       const mgs = allocateMg_greedy(cand.map(d => d.time), pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep);
       cand.forEach((d, i) => { d.mg = snapM(mgs[i]); });
@@ -271,7 +301,7 @@ function optimizer_OLD(sc) {
 /* ---------- NEW optimizer: 15-min grid + LP + coordinate descent ---------- */
 function optimizer_NEW(sc) {
   const ctx = buildContext(sc);
-  const { nNew, pS, pE, sT, respectSleep, locked, tMin, tMax, mgMin, mgMax, totalBudget, sleepBudget } = ctx;
+  const { nNew, pS, pE, sT, respectSleep, locked, lockedSleepLevel, tMin, tMax, mgMin, mgMax, totalBudget, sleepBudget, isBlocked } = ctx;
   const N = Math.max(1, Math.min(8, nNew | 0));
   if (tMin >= tMax - 0.1) {
     return Array.from({ length: N }, (_, i) => ({
@@ -280,14 +310,21 @@ function optimizer_NEW(sc) {
   }
   const buildFromTimes = (times) => {
     const mgs = allocateMg_LP(times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep);
-    return times.map((t, i) => ({ time: snapT(t), mg: snapM(mgs[i]) }));
+    const raw = times.map((t, i) => ({ time: snapT(t), mg: mgs[i] }));
+    return snapMgRespectSleep(raw, sT, lockedSleepLevel, respectSleep);
   };
   const gridLo = Math.max(tMin, pS - 1.5);
   const gridHi = Math.min(tMax, pE + 0.25);
   const slots = [];
-  for (let t = gridLo; t <= gridHi + 1e-9; t += 0.25) slots.push(Math.round(t * 12) / 12);
-  if (slots.length === 0 || slots[0] > tMin + 1e-9) slots.unshift(tMin);
-  if (slots[slots.length - 1] < tMax - 1e-9) slots.push(tMax);
+  for (let t = gridLo; t <= gridHi + 1e-9; t += 0.25) {
+    const st = Math.round(t * 12) / 12;
+    if (!isBlocked(st)) slots.push(st);
+  }
+  if ((slots.length === 0 || slots[0] > tMin + 1e-9) && !isBlocked(tMin)) slots.unshift(tMin);
+  if (slots.length && slots[slots.length - 1] < tMax - 1e-9 && !isBlocked(tMax)) slots.push(tMax);
+  if (slots.length === 0) return Array.from({ length: N }, (_, i) => ({
+    time: snapT(clamp(tMin + i * 0.25, tMin, tMax)), mg: mgMin, type: "custom", locked: false,
+  }));
   let best = null, bestScore = -Infinity;
   const MAX_COMBOS = 10000;
   if (N <= 4) {
@@ -342,6 +379,7 @@ function optimizer_NEW(sc) {
       for (const d of deltas) {
         const newT = snapT(clamp(origT + d * fiveMin, tMin, tMax));
         if (newT === origT) continue;
+        if (isBlocked(newT)) continue;
         const times = best.map((x, j) => j === i ? newT : x.time).sort((a, b) => a - b);
         const cand = buildFromTimes(times);
         const sc2 = scoreCandidate(ctx, cand);
@@ -358,7 +396,7 @@ function optimizer_NEW(sc) {
 /* ---------- TRUTH: exhaustive 5-min grid + LP per config ---------- */
 function optimizer_TRUTH(sc) {
   const ctx = buildContext(sc);
-  const { nNew, pS, pE, sT, respectSleep, locked, tMin, tMax, mgMin, mgMax, totalBudget, sleepBudget } = ctx;
+  const { nNew, pS, pE, sT, respectSleep, locked, lockedSleepLevel, tMin, tMax, mgMin, mgMax, totalBudget, sleepBudget, isBlocked } = ctx;
   const N = Math.max(1, Math.min(8, nNew | 0));
   if (tMin >= tMax - 0.1) {
     return Array.from({ length: N }, (_, i) => ({
@@ -367,11 +405,15 @@ function optimizer_TRUTH(sc) {
   }
   const buildFromTimes = (times) => {
     const mgs = allocateMg_LP(times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep);
-    return times.map((t, i) => ({ time: snapT(t), mg: snapM(mgs[i]) }));
+    const raw = times.map((t, i) => ({ time: snapT(t), mg: mgs[i] }));
+    return snapMgRespectSleep(raw, sT, lockedSleepLevel, respectSleep);
   };
   // Fine 5-min grid. We still cap tMax at peak end (doses past that contribute 0 to peak avg).
   const slots = [];
-  for (let t = tMin; t <= tMax + 1e-9; t += 1 / 12) slots.push(Math.round(t * 12) / 12);
+  for (let t = tMin; t <= tMax + 1e-9; t += 1 / 12) {
+    const st = Math.round(t * 12) / 12;
+    if (!isBlocked(st)) slots.push(st);
+  }
   let best = null, bestScore = -Infinity;
   const acc = [];
   const rec = (start) => {
@@ -390,8 +432,14 @@ function optimizer_TRUTH(sc) {
   if (N > 3) {
     // Fall back to 15-min grid so truth remains tractable for N=4
     slots.length = 0;
-    for (let t = tMin; t <= tMax + 1e-9; t += 0.25) slots.push(Math.round(t * 12) / 12);
+    for (let t = tMin; t <= tMax + 1e-9; t += 0.25) {
+      const st = Math.round(t * 12) / 12;
+      if (!isBlocked(st)) slots.push(st);
+    }
   }
+  if (slots.length === 0) return Array.from({ length: N }, (_, i) => ({
+    time: snapT(clamp(tMin + i * 0.25, tMin, tMax)), mg: mgMin, type: "custom", locked: false,
+  }));
   rec(0);
   if (!best) best = Array.from({ length: N }, (_, i) => ({ time: snapT(clamp(tMin + i * 0.25, tMin, tMax)), mg: mgMin }));
   return best.map(d => ({ time: d.time, mg: d.mg, type: "custom", locked: false }));
@@ -458,6 +506,39 @@ const scenarios = [
     name: "Afternoon start (planToday, now=15:00)",
     nNew: 2, pS: 15, pE: 19, sT: 23, earliestTime: 15.25, locked: [],
   },
+
+  // Blocked windows (gym-time, meeting, etc.)
+  {
+    name: "Gym 12-1pm, 2 doses, morning peak",
+    nNew: 2, pS: 9, pE: 13, sT: 23, locked: [],
+    blockedWindows: [{ start: 12, end: 13 }],
+  },
+  {
+    name: "Gym 6-7pm (no impact on morning plan)",
+    nNew: 2, pS: 9, pE: 13, sT: 23, locked: [],
+    blockedWindows: [{ start: 18, end: 19 }],
+  },
+  {
+    name: "Two blocks: gym 12-1pm + meeting 3-4pm",
+    nNew: 3, pS: 10, pE: 16, sT: 23, locked: [],
+    blockedWindows: [{ start: 12, end: 13 }, { start: 15, end: 16 }],
+  },
+  {
+    name: "Block overlaps peak start (9-10am, peak 9-13)",
+    nNew: 2, pS: 9, pE: 13, sT: 23, locked: [],
+    blockedWindows: [{ start: 9, end: 10 }],
+  },
+  {
+    name: "Block covers most of morning",
+    nNew: 2, pS: 9, pE: 13, sT: 23, locked: [],
+    blockedWindows: [{ start: 8, end: 11 }],
+  },
+  {
+    name: "Block + 1 locked dose (realistic)",
+    nNew: 2, pS: 10, pE: 14, sT: 23,
+    locked: [{ time: 8, mg: 100, locked: true }],
+    blockedWindows: [{ start: 11, end: 12.5 }],
+  },
 ];
 
 /* ---------- Runner ---------- */
@@ -478,13 +559,24 @@ function evaluate(label, fn, sc, runs = 1) {
   const avg = peakAverage(merged, sc.pS, sc.pE, 0.05);
   const sleep = caffeineAt(sc.sT, merged);
   const total = merged.reduce((a, d) => a + d.mg, 0);
+  // Violation = excess beyond what's physically unavoidable.
+  // Min possible sleep contribution from new doses = N * mgMin * sleepCoef at the earliest allowed time
+  // (earliest => most decay => lowest coef). If final sleep > max(50, lockedAlone + forcedMin),
+  // the algorithm added unnecessary sleep.
+  const lockedAloneSleep = (sc.locked || []).length ? caffeineAt(sc.sT, sc.locked) : 0;
+  const tMinForced = Math.max(4, sc.pS - 2, sc.earliestTime ?? 0);
+  const forcedMinNew = best.length * 10 * sleepCoefAt(tMinForced, sc.sT);
+  const floor = Math.max(SLEEP_THRESHOLD, lockedAloneSleep + forcedMinNew);
+  const sleepOver = (sc.respectSleep ?? true) ? Math.max(0, sleep - floor - 0.05) : 0;
+  const blockedHits = (sc.blockedWindows || []).reduce((a, w) =>
+    a + best.filter(d => d.time >= w.start - 1e-9 && d.time < w.end - 1e-9).length, 0);
   const variance = runs > 1 ? (() => {
     const scores = results.map(r => r.sc2);
     const m = scores.reduce((a, b) => a + b, 0) / scores.length;
     const v = scores.reduce((a, b) => a + (b - m) ** 2, 0) / scores.length;
     return Math.sqrt(v);
   })() : 0;
-  return { label, best, avg, sleep, total, ms, variance, bestScore };
+  return { label, best, avg, sleep, total, ms, variance, bestScore, sleepOver, blockedHits };
 }
 
 function fmtDoses(doses) {
@@ -513,15 +605,21 @@ function runScenario(sc) {
     return (((rTruth.avg - r.avg) / rTruth.avg) * 100).toFixed(2);
   };
 
-  const row = (r) =>
-    r.label + " | " +
-    ("peakAvg " + r.avg.toFixed(2) + "mg").padEnd(18) +
-    ("sleep " + r.sleep.toFixed(1)).padEnd(13) +
-    ("tot " + r.total.toFixed(0)).padEnd(10) +
-    ("gap " + gap(r) + "%").padEnd(12) +
-    ("t " + r.ms.toFixed(1) + "ms").padEnd(12) +
-    (r.variance > 0 ? "σ=" + r.variance.toFixed(3) : "") +
-    "\n       doses: " + fmtDoses(r.best);
+  const row = (r) => {
+    const flags = [];
+    if (r.sleepOver > 1e-3) flags.push("⚠sleep+" + r.sleepOver.toFixed(1));
+    if (r.blockedHits > 0) flags.push("⛔blocked×" + r.blockedHits);
+    const flagStr = flags.length ? " " + flags.join(" ") : "";
+    return r.label + " | " +
+      ("peakAvg " + r.avg.toFixed(2) + "mg").padEnd(18) +
+      ("sleep " + r.sleep.toFixed(1)).padEnd(13) +
+      ("tot " + r.total.toFixed(0)).padEnd(10) +
+      ("gap " + gap(r) + "%").padEnd(12) +
+      ("t " + r.ms.toFixed(1) + "ms").padEnd(12) +
+      (r.variance > 0 ? "σ=" + r.variance.toFixed(3) : "") +
+      flagStr +
+      "\n       doses: " + fmtDoses(r.best);
+  };
 
   console.log(row(rOld));
   console.log(row(rNew));
@@ -540,6 +638,7 @@ console.log("SUMMARY (lower gap = better; gap is % short of TRUTH peak avg)");
 console.log("─".repeat(86));
 const gapOf = (r, truth) => truth.avg <= 1e-6 ? 0 : ((truth.avg - r.avg) / truth.avg) * 100;
 let sumOld = 0, sumNew = 0, worstOld = 0, worstNew = 0, winsOld = 0, winsNew = 0, ties = 0;
+let sleepVioOld = 0, sleepVioNew = 0, blockVioOld = 0, blockVioNew = 0;
 for (const { rOld, rNew, rTruth } of results) {
   const gO = gapOf(rOld, rTruth);
   const gN = gapOf(rNew, rTruth);
@@ -548,9 +647,15 @@ for (const { rOld, rNew, rTruth } of results) {
   if (rNew.avg > rOld.avg + 0.05) winsNew++;
   else if (rOld.avg > rNew.avg + 0.05) winsOld++;
   else ties++;
+  if (rOld.sleepOver > 1e-3) sleepVioOld++;
+  if (rNew.sleepOver > 1e-3) sleepVioNew++;
+  blockVioOld += rOld.blockedHits;
+  blockVioNew += rNew.blockedHits;
 }
 const n = results.length;
-console.log(`  OLD avg gap: ${(sumOld / n).toFixed(3)}%   worst: ${worstOld.toFixed(2)}%`);
-console.log(`  NEW avg gap: ${(sumNew / n).toFixed(3)}%   worst: ${worstNew.toFixed(2)}%`);
-console.log(`  Head-to-head (NEW vs OLD): NEW wins ${winsNew}, OLD wins ${winsOld}, ties ${ties}`);
+console.log(`  OLD   avg gap: ${(sumOld / n).toFixed(3)}%   worst: ${worstOld.toFixed(2)}%`);
+console.log(`  NEW   avg gap: ${(sumNew / n).toFixed(3)}%   worst: ${worstNew.toFixed(2)}%`);
+console.log(`  Sleep-cap violations (scenarios with overshoot): OLD=${sleepVioOld}/${n}  NEW=${sleepVioNew}/${n}`);
+console.log(`  Blocked-window violations (doses inside blocked): OLD=${blockVioOld}  NEW=${blockVioNew}`);
+console.log(`  Head-to-head peak (NEW vs OLD): NEW wins ${winsNew}, OLD wins ${winsOld}, ties ${ties}`);
 console.log(`  Determinism: NEW is deterministic (σ=0), OLD is stochastic`);

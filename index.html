@@ -287,6 +287,7 @@ const STORAGE_KEYS = {
   peakStart: "cf-pS",
   peakEnd:   "cf-pE",
   sleepTime: "cf-sT",
+  blockedWindows: "cf-blocked",
 };
 
 const toneColor = tone =>
@@ -451,14 +452,17 @@ const allocateMg = (times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, r
 
 /* Main optimizer. Deterministic — same inputs produce the same output.
    - `lockedDoses` are fixed and contribute to peak + sleep + total budgets.
+   - `blockedWindows` is an array of {start, end} (hours). New doses never land inside.
    - Produces `nNew` optimized doses (times + mg).
    - Grid-search (15-min) over time configs + exact LP mg allocation per config,
      then coordinate-descent refinement at 5-min resolution. */
 const optimizeDoses = ({
-  nNew, pS, pE, sT, respectSleep, capTotal, seedDoses, lockedDoses, earliestTime
+  nNew, pS, pE, sT, respectSleep, capTotal, seedDoses, lockedDoses, earliestTime, blockedWindows
 }) => {
   const N = Math.max(1, Math.min(8, nNew | 0));
   const locked = lockedDoses || [];
+  const blocks = (blockedWindows || []).filter(w => w && w.end > w.start + 1e-6);
+  const isBlocked = (t) => blocks.some(w => t >= w.start - 1e-9 && t < w.end - 1e-9);
   const TOTAL_CAP_RAW = capTotal ? DAILY_LIMIT : 800;
   const lockedTotal = locked.reduce((a, d) => a + d.mg, 0);
   const lockedSleepLevel = locked.length ? caffeineAt(sT, locked) : 0;
@@ -471,7 +475,28 @@ const optimizeDoses = ({
   const mgMin = 10, mgMax = 300;
   const clamp = (v, mn, mx) => Math.max(mn, Math.min(mx, v));
   const snapT = t => Math.round(t * 12) / 12;
-  const snapM = m => Math.round(m / 5) * 5;
+  // Snap mg to 5mg increments. If that pushes sleep past threshold (LP held it at ≤budget
+  // in continuous form, but rounding can overshoot), trim 5mg off the dose with the
+  // largest sleep coefficient that's still above mgMin, repeat until under budget.
+  const snapMgRespectSleep = (cand) => {
+    const snapped = cand.map(d => ({ ...d, mg: Math.round(d.mg / 5) * 5 }));
+    if (!respectSleep) return snapped;
+    const sCoefs = snapped.map(d => sleepCoefAt(d.time, sT));
+    const remaining = Math.max(0, SLEEP_THRESHOLD - lockedSleepLevel);
+    let sleepUsed = snapped.reduce((a, d, i) => a + sCoefs[i] * d.mg, 0);
+    let guard = 0;
+    while (sleepUsed > remaining + 1e-6 && guard++ < 200) {
+      let pick = -1, pickScore = -Infinity;
+      for (let i = 0; i < snapped.length; i++) {
+        if (snapped[i].mg <= mgMin) continue;
+        if (sCoefs[i] > pickScore) { pickScore = sCoefs[i]; pick = i; }
+      }
+      if (pick < 0) break;
+      snapped[pick].mg -= 5;
+      sleepUsed -= 5 * sCoefs[pick];
+    }
+    return snapped;
+  };
 
   // No valid window (peak window already passed, or bedtime too close)
   if (tMin >= tMax - 0.1) {
@@ -500,10 +525,13 @@ const optimizeDoses = ({
     return peakAvg - penalty;
   };
 
-  // Build a candidate from a given set of times using the analytical mg allocator
+  // Build a candidate from a given set of times using the exact LP mg allocator.
+  // LP solution is snap-rounded to 5mg; if the rounding pushes sleep past threshold,
+  // trim back the dose with the largest sleep contribution.
   const buildFromTimes = (times) => {
     const mgs = allocateMg(times, pS, pE, sT, mgMin, mgMax, totalBudget, sleepBudget, respectSleep);
-    return times.map((t, i) => ({ time: snapT(t), mg: snapM(mgs[i]) }));
+    const raw = times.map((t, i) => ({ time: snapT(t), mg: mgs[i] }));
+    return snapMgRespectSleep(raw);
   };
 
   // --- Deterministic grid search over dose-time configurations ---
@@ -512,9 +540,19 @@ const optimizeDoses = ({
   const gridHi = Math.min(tMax, pE + 0.25);
   const gridStep = 0.25;
   const slots = [];
-  for (let t = gridLo; t <= gridHi + 1e-9; t += gridStep) slots.push(Math.round(t * 12) / 12);
-  if (slots.length === 0 || slots[0] > tMin + 1e-9) slots.unshift(tMin);
-  if (slots[slots.length - 1] < tMax - 1e-9) slots.push(tMax);
+  for (let t = gridLo; t <= gridHi + 1e-9; t += gridStep) {
+    const st = Math.round(t * 12) / 12;
+    if (!isBlocked(st)) slots.push(st);
+  }
+  if ((slots.length === 0 || slots[0] > tMin + 1e-9) && !isBlocked(tMin)) slots.unshift(tMin);
+  if (slots.length && slots[slots.length - 1] < tMax - 1e-9 && !isBlocked(tMax)) slots.push(tMax);
+  // All slots blocked? Fall back to minimum doses at tMin.
+  if (slots.length === 0) {
+    return Array.from({ length: N }, (_, i) => ({
+      time: snapT(clamp(tMin + i * 0.25, tMin, tMax)),
+      mg: mgMin, type: "custom", locked: false,
+    }));
+  }
 
   let best = null, bestScore = -Infinity;
   const MAX_COMBOS = 10000;
@@ -564,12 +602,14 @@ const optimizeDoses = ({
     rec(0);
   }
 
-  // Seed-dose: evaluate user's current config too
+  // Seed-dose: evaluate user's current config too (skip if any seed time is blocked)
   if (seedDoses && seedDoses.length === N) {
     const seedTimes = seedDoses.map(d => snapT(clamp(d.time, tMin, tMax))).sort((a, b) => a - b);
-    const cand = buildFromTimes(seedTimes);
-    const s = score(cand);
-    if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+    if (!seedTimes.some(isBlocked)) {
+      const cand = buildFromTimes(seedTimes);
+      const s = score(cand);
+      if (s > bestScore) { best = cand.map(x => ({ ...x })); bestScore = s; }
+    }
   }
 
   if (!best) {
@@ -593,6 +633,7 @@ const optimizeDoses = ({
       for (const d of deltas) {
         const newT = snapT(clamp(origT + d * fiveMin, tMin, tMax));
         if (newT === origT) continue;
+        if (isBlocked(newT)) continue;
         const times = best.map((x, j) => j === i ? newT : x.time).sort((a, b) => a - b);
         const cand = buildFromTimes(times);
         const sc = score(cand);
@@ -632,7 +673,7 @@ function useAnimatedNumber(target, duration = 500) {
 }
 
 /* ---------- Chart ---------- */
-function Chart({ doses, pS, pE, sT, clearTime, nowHour, showNow }) {
+function Chart({ doses, pS, pE, sT, clearTime, nowHour, showNow, blockedWindows }) {
   const ref = useRef(null);
   const [hover, setHover] = useState(null);
   const [dims, setDims] = useState({ W: 0, H: 0 });
@@ -677,6 +718,33 @@ function Chart({ doses, pS, pE, sT, clearTime, nowHour, showNow }) {
     ctx.fillRect(xO(pS), p.t, xO(pE) - xO(pS), cH);
     ctx.fillStyle = "rgba(232,114,114,0.06)";
     ctx.fillRect(xO(sT), p.t, xO(eT) - xO(sT), cH);
+
+    // Blocked windows — striped red-ish overlay
+    if (blockedWindows && blockedWindows.length) {
+      for (const w of blockedWindows) {
+        if (!w || w.end <= w.start) continue;
+        const x0 = xO(Math.max(w.start, 6));
+        const x1 = xO(Math.min(w.end, eT));
+        if (x1 <= x0) continue;
+        ctx.fillStyle = "rgba(232,154,79,0.08)";
+        ctx.fillRect(x0, p.t, x1 - x0, cH);
+        // Diagonal hatch lines
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x0, p.t, x1 - x0, cH);
+        ctx.clip();
+        ctx.strokeStyle = "rgba(232,154,79,0.22)";
+        ctx.lineWidth = 1;
+        const hatchStep = 8;
+        for (let hx = x0 - cH; hx < x1 + cH; hx += hatchStep) {
+          ctx.beginPath();
+          ctx.moveTo(hx, p.t + cH);
+          ctx.lineTo(hx + cH, p.t);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
 
     // Horizontal grid
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
@@ -856,7 +924,7 @@ function Chart({ doses, pS, pE, sT, clearTime, nowHour, showNow }) {
       ctx.textAlign = "left";
       ctx.fillText(label, bx + 8, by + 15);
     }
-  }, [doses, pS, pE, sT, clearTime, nowHour, showNow]);
+  }, [doses, pS, pE, sT, clearTime, nowHour, showNow, blockedWindows]);
 
   useEffect(() => { hoverRef.current = hover; }, [hover]);
 
@@ -1048,6 +1116,15 @@ function App() {
   const [capTotal, setCapTotal] = useState(true);
   const [planToday, setPlanToday] = useState(true);
   const [targetDoseCount, setTargetDoseCount] = useState(Math.max(1, unlockedCount));
+  const [blockedWindows, setBlockedWindows] = useState(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEYS.blockedWindows);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.blockedWindows, JSON.stringify(blockedWindows));
+  }, [blockedWindows]);
   const [prevDoses, setPrevDoses] = useState(null);
   const [lastOpt, setLastOpt] = useState(null);
   const [optimizing, setOptimizing] = useState(false);
@@ -1071,6 +1148,7 @@ function App() {
         seedDoses: targetDoseCount === effectiveUnlocked.length ? effectiveUnlocked : null,
         lockedDoses: effectiveLocked,
         earliestTime: earliestNew,
+        blockedWindows,
       });
       const merged = [...effectiveLocked, ...optimized].sort((a, b) => a.time - b.time);
       setPrevDoses(doses);
@@ -1186,9 +1264,9 @@ function App() {
             <span style={{ fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.15em", color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
               Blood caffeine · mg
             </span>
-            <Legend showNow={planToday} />
+            <Legend showNow={planToday} showBlocked={blockedWindows.length > 0} />
           </div>
-          <Chart doses={doses} pS={pS} pE={pE} sT={sT} clearTime={clearTime} nowHour={nowHour} showNow={planToday} />
+          <Chart doses={doses} pS={pS} pE={pE} sT={sT} clearTime={clearTime} nowHour={nowHour} showNow={planToday} blockedWindows={blockedWindows} />
         </div>
 
         {/* Tips */}
@@ -1312,6 +1390,11 @@ function App() {
               onChange={setPlanToday}
             />
           </div>
+
+          <BlockedWindowsEditor
+            windows={blockedWindows}
+            setWindows={setBlockedWindows}
+          />
 
           <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
             <button
@@ -1605,6 +1688,159 @@ function OptimizerToggle({ label, hint, checked, onChange }) {
   );
 }
 
+function BlockedWindowsEditor({ windows, setWindows }) {
+  const add = () => {
+    const last = windows[windows.length - 1];
+    const start = last ? Math.min(23, last.end + 1) : 12;
+    const end = Math.min(24, start + 1);
+    setWindows([...windows, { start, end, label: "" }]);
+  };
+  const remove = (i) => setWindows(windows.filter((_, j) => j !== i));
+  const update = (i, patch) => setWindows(windows.map((w, j) => j === i ? { ...w, ...patch } : w));
+  return (
+    <div style={{
+      background: "var(--surface-2)",
+      border: "1px solid var(--line)",
+      borderRadius: "var(--r)",
+      padding: "12px 14px",
+      margin: "12px 0 14px",
+      display: "flex", flexDirection: "column", gap: "10px"
+    }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+        <div>
+          <div style={{
+            fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.15em",
+            color: "var(--ink-soft)", fontFamily: "var(--mono)", fontWeight: 500
+          }}>Unavailable windows</div>
+          <div style={{ fontSize: "11px", color: "var(--ink-soft)", marginTop: "2px" }}>
+            Optimizer won't place doses during these times (gym, meetings, etc.)
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={add}
+          className="btn-lift"
+          style={{
+            padding: "6px 12px",
+            borderRadius: "var(--r-sm)",
+            border: "1px solid var(--line-2)",
+            background: "transparent",
+            color: "var(--ink-dim)",
+            cursor: "pointer",
+            fontSize: "12px",
+            fontFamily: "var(--mono)",
+          }}
+        >+ Add</button>
+      </div>
+      {windows.length === 0 ? (
+        <div style={{ fontSize: "12px", color: "var(--ink-soft)", fontStyle: "italic", fontFamily: "var(--serif)" }}>
+          No blocked windows.
+        </div>
+      ) : (
+        windows.map((w, i) => (
+          <BlockedWindowRow
+            key={i}
+            window={w}
+            onChange={(patch) => update(i, patch)}
+            onRemove={() => remove(i)}
+          />
+        ))
+      )}
+    </div>
+  );
+}
+
+function BlockedWindowRow({ window, onChange, onRemove }) {
+  const [draftStart, setDraftStart] = useState(window.start);
+  const [draftEnd, setDraftEnd] = useState(window.end);
+  useEffect(() => { setDraftStart(window.start); }, [window.start]);
+  useEffect(() => { setDraftEnd(window.end); }, [window.end]);
+  const startTimer = useRef(null);
+  const endTimer = useRef(null);
+  useEffect(() => () => { clearTimeout(startTimer.current); clearTimeout(endTimer.current); }, []);
+
+  const handleStart = (e) => {
+    const v = parseFloat(e.target.value);
+    setDraftStart(v);
+    clearTimeout(startTimer.current);
+    startTimer.current = setTimeout(() => {
+      onChange({ start: v, end: Math.max(v + 0.25, draftEnd) });
+    }, 120);
+  };
+  const handleEnd = (e) => {
+    const v = parseFloat(e.target.value);
+    setDraftEnd(v);
+    clearTimeout(endTimer.current);
+    endTimer.current = setTimeout(() => {
+      onChange({ end: v, start: Math.min(draftStart, v - 0.25) });
+    }, 120);
+  };
+
+  const spct = ((draftStart - 4) / (24 - 4)) * 100;
+  const epct = ((draftEnd - 4) / (24 - 4)) * 100;
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "1fr auto",
+      gap: "8px 12px",
+      alignItems: "center",
+      padding: "10px 12px",
+      background: "rgba(232,154,79,0.06)",
+      border: "1px solid rgba(232,154,79,0.18)",
+      borderRadius: "var(--r-sm)",
+    }}>
+      <input
+        type="text"
+        value={window.label ?? ""}
+        onChange={(e) => onChange({ label: e.target.value })}
+        placeholder="e.g. Gym, Meeting"
+        style={{
+          background: "transparent", border: "none", outline: "none",
+          color: "var(--ink)", fontSize: "13px", fontWeight: 500,
+          padding: 0, width: "100%", fontFamily: "var(--sans)"
+        }}
+      />
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label="Remove window"
+        className="btn-lift"
+        style={{
+          background: "transparent", border: "1px solid var(--line-2)",
+          color: "var(--ink-soft)", cursor: "pointer",
+          width: "26px", height: "26px", borderRadius: "50%",
+          fontSize: "14px", lineHeight: 1, display: "inline-flex",
+          alignItems: "center", justifyContent: "center",
+        }}
+      >×</button>
+      <div style={{ gridColumn: "1 / -1", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", color: "var(--ink-soft)", fontFamily: "var(--mono)", marginBottom: "2px" }}>
+            <span>Start</span>
+            <span style={{ color: "var(--accent-2)" }}>{fmtTime(draftStart, true)}</span>
+          </div>
+          <input
+            type="range" min={4} max={24} step={0.25}
+            value={draftStart} onChange={handleStart}
+            style={{ "--pct": `${spct}%` }}
+          />
+        </div>
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", color: "var(--ink-soft)", fontFamily: "var(--mono)", marginBottom: "2px" }}>
+            <span>End</span>
+            <span style={{ color: "var(--accent-2)" }}>{fmtTime(draftEnd, true)}</span>
+          </div>
+          <input
+            type="range" min={4} max={24} step={0.25}
+            value={draftEnd} onChange={handleEnd}
+            style={{ "--pct": `${epct}%` }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DoseRow({ index, dose, onChange, onRemove, isOnlyDose, enterDelay = 0, isPast = false }) {
   const [draftMg, setDraftMg] = useState(dose.mg);
   const [draftTime, setDraftTime] = useState(dose.time);
@@ -1840,13 +2076,14 @@ function ScheduleRow({ label, hint, value, setValue, min, max }) {
   );
 }
 
-function Legend({ showNow }) {
+function Legend({ showNow, showBlocked }) {
   const items = [
     { c: "var(--accent)", l: "Caffeine" },
     { c: "rgba(111,201,165,0.4)", l: "Peak window", sq: true },
     { c: "rgba(232,114,114,0.4)", l: "Sleep window", sq: true },
     { c: "var(--good)", l: "Safe marker", dot: true },
     ...(showNow ? [{ c: "rgba(243,238,228,0.55)", l: "Now", dash: true }] : []),
+    ...(showBlocked ? [{ c: "rgba(232,154,79,0.5)", l: "Unavailable", sq: true }] : []),
   ];
   return (
     <div style={{ display: "flex", gap: "14px", flexWrap: "wrap", fontSize: "11px", color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
